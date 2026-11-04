@@ -1,0 +1,56 @@
+{
+  "id": "com.kraken.azure-keyvault",
+  "name": "Azure Key Vault Integration",
+  "version": "1.0.0",
+  "description": "Integração segura com Azure Key Vault para controle e resolução Just-in-Time de senhas de servidores sem persistência em banco local.",
+  "author": "Kraken Community",
+  "license": "Apache-2.0",
+  "runtime": {
+    "type": "wasm",
+    "entrypoint": "backend/plugin.wasm"
+  },
+  "frontend": {
+    "entrypoint": "frontend/worker.js"
+  },
+  "permissions": [
+    "ui:sidebar",
+    "ui:dashboard_widget",
+    "ui:server_tab",
+    "storage:kv",
+    "http:outbound",
+    "credentials:resolve",
+    "credentials:manage",
+    "hosts:read",
+    "hosts:exec"
+  ],
+  "allowed_hosts": [
+    "login.microsoftonline.com",
+    "graph.microsoft.com",
+    "*.vault.azure.net",
+    "169.254.169.254",
+    "microsoft.com"
+  ],
+  "ui_extensions": {
+    "sidebar": [
+      {
+        "id": "nav-azure-kv",
+        "title": "Azure Key Vault",
+        "icon": "key",
+        "badge": "JIT"
+      }
+    ],
+    "dashboard_widgets": [
+      {
+        "id": "widget-azure-kv",
+        "title": "Azure Key Vault Credentials"
+      }
+    ],
+    "server_tabs": [
+      {
+        "id": "tab-azure-kv-server",
+        "title": "Azure Key Vault Bind",
+        "icon": "lock"
+      }
+    ]
+  }
+}
