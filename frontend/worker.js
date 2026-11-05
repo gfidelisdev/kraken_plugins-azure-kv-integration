@@ -18,6 +18,7 @@ const state = {
     active_account_id: "",
     accounts: [] // [{ id, email, name, tenant_id, source, token, access_token, refresh_token, expires_at }]
   },
+  accountVaultRegistry: {}, // email / __last_configured__ -> { vault_name, vault_url, tenant_id, discovered_vaults, updated_at }
   discoveredVaults: [],
   discoveringVaults: false,
   krakenUser: null,
@@ -37,6 +38,20 @@ const state = {
     selected_server_id: "",
     secret_name: "",
     create_new_secretValue: ""
+  },
+  bindModal: {
+    isOpen: false,
+    mode: "existing", // "existing" | "new_server"
+    secretName: "",
+    selectedServerId: "",
+    newServerName: "",
+    newServerHost: "",
+    newServerPort: "22",
+    newServerType: "ssh",
+    newServerUser: "root",
+    isSubmitting: false,
+    errorMessage: "",
+    successMessage: ""
   },
   secrets: [],
   secretsTable: {
@@ -174,6 +189,81 @@ async function idbClear() {
   });
 }
 
+async function idbRemove(key) {
+  const db = await openLocalIDB();
+  if (!db) return;
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction("kv", "readwrite");
+      tx.objectStore("kv").delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    } catch (_) {
+      resolve();
+    }
+  });
+}
+
+// -------------------------------------------------------------
+// Persistent Account-to-Vault Database Registry (KV / SQLite)
+// -------------------------------------------------------------
+
+async function loadAccountVaultRegistry() {
+  try {
+    const raw = await self.kraken.kv.get("account_vault_registry");
+    if (raw) {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (parsed && typeof parsed === "object") {
+        state.accountVaultRegistry = { ...state.accountVaultRegistry, ...parsed };
+      }
+    }
+  } catch (err) {
+    self.kraken.log("Fallback ao carregar registro de cofres do backend: " + (err.message || err));
+  }
+
+  try {
+    const idbRaw = await idbGet("account_vault_registry");
+    if (idbRaw) {
+      const parsed = typeof idbRaw === "string" ? JSON.parse(idbRaw) : idbRaw;
+      if (parsed && typeof parsed === "object") {
+        state.accountVaultRegistry = { ...parsed, ...state.accountVaultRegistry };
+      }
+    }
+  } catch (_) {}
+}
+
+async function saveAccountVaultRegistry() {
+  try {
+    const serialized = JSON.stringify(state.accountVaultRegistry);
+    await idbSet("account_vault_registry", serialized);
+    await self.kraken.kv.set("account_vault_registry", serialized);
+  } catch (err) {
+    self.kraken.log("Erro ao salvar registro de cofres no backend: " + (err.message || err));
+  }
+}
+
+function registerAccountVault(email, vaultName, vaultUrl, tenantId) {
+  if (!vaultName) return;
+  const vName = String(vaultName).trim();
+  const vUrl = String(vaultUrl || `https://${vName}.vault.azure.net`).trim();
+  const disc = (state.discoveredVaults && state.discoveredVaults.length > 0)
+    ? state.discoveredVaults
+    : [{ name: vName, url: vUrl, location: "saved-vault" }];
+
+  const entry = {
+    vault_name: vName,
+    vault_url: vUrl,
+    tenant_id: tenantId || state.config.tenant_id || "",
+    discovered_vaults: disc,
+    updated_at: Date.now()
+  };
+
+  if (email && typeof email === "string" && email.trim() !== "") {
+    state.accountVaultRegistry[email.toLowerCase().trim()] = entry;
+  }
+  state.accountVaultRegistry["__last_configured__"] = entry;
+}
+
 // -------------------------------------------------------------
 // Backend Host Adapter Invocation Helper
 // -------------------------------------------------------------
@@ -225,6 +315,75 @@ async function callBackendAction(action, payload, maxRetries = 4) {
     }
   }
   return null;
+}
+
+// -------------------------------------------------------------
+// Kraken Server Registration & Modal Bind Helpers
+// -------------------------------------------------------------
+
+async function requestCreateServer(payload) {
+  const sanitizedPayload = {
+    name: String(payload.name || "").trim(),
+    host_url: String(payload.host_url || "").trim(),
+    server_host: String(payload.server_host || "").trim(),
+    server_port: String(payload.server_port || "").trim(),
+    ssh_user: String(payload.ssh_user || "").trim(),
+    ssh_auth_method: String(payload.ssh_auth_method || "").trim(),
+    credential_source: "plugin",
+    credential_plugin_id: "com.kraken.azure-keyvault",
+    secret_reference: String(payload.secret_reference || "").trim(),
+    credential_policy: "save_securely"
+  };
+
+  // Route securely through the host renderer bridge (authenticated with host session)
+  return new Promise((resolve) => {
+    const id = "req_" + Math.random().toString(36).substr(2, 9);
+    const listener = (e) => {
+      if (e.data && e.data.type === "KRAKEN_CREATE_SERVER_REPLY" && e.data.id === id) {
+        self.removeEventListener("message", listener);
+        resolve(e.data);
+      }
+    };
+    self.addEventListener("message", listener);
+    self.postMessage({ type: "KRAKEN_CREATE_SERVER", id, payload: sanitizedPayload });
+    setTimeout(() => {
+      self.removeEventListener("message", listener);
+      resolve({ success: false, error: "Tempo limite esgotado ao cadastrar servidor no Kraken." });
+    }, 15000);
+  });
+}
+
+function handleOpenBindModal(secretName) {
+  if (!secretName) return;
+  state.bindModal.isOpen = true;
+  state.bindModal.mode = "existing";
+  state.bindModal.secretName = secretName;
+  state.bindModal.errorMessage = "";
+  state.bindModal.successMessage = "";
+  state.bindModal.isSubmitting = false;
+
+  // Suggest a clean server name based on secretName
+  const cleanSug = secretName.toLowerCase().replace(/^(srv-|vm-|host-)/, "").replace(/(-pwd|-secret|-pass|-key)$/, "");
+  state.bindModal.newServerName = `srv-${cleanSug || "novo"}`;
+  state.bindModal.newServerHost = "";
+  state.bindModal.newServerPort = "22";
+  state.bindModal.newServerType = "ssh";
+  state.bindModal.newServerUser = "root";
+
+  // Check if any server is already bound to this secret
+  const alreadyBound = state.servers.find(srv => {
+    const bound = (state.config.server_bindings && (state.config.server_bindings[srv.id] || state.config.server_bindings[srv.hostname] || state.config.server_bindings[srv.name]));
+    return bound === secretName;
+  });
+  if (alreadyBound) {
+    state.bindModal.selectedServerId = String(alreadyBound.id);
+  } else if (state.servers.length > 0) {
+    state.bindModal.selectedServerId = String(state.servers[0].id);
+  } else {
+    state.bindModal.selectedServerId = "";
+    state.bindModal.mode = "new_server";
+  }
+  renderUI();
 }
 
 // -------------------------------------------------------------
@@ -308,9 +467,52 @@ async function loadConfig() {
         state.config = { ...state.config, ...parsed };
         if (!state.config.server_bindings) state.config.server_bindings = {};
         if (!Array.isArray(state.config.accounts)) state.config.accounts = [];
+        if (!state.config.account_vaults) state.config.account_vaults = {};
+
+        // Restore saved discoveredVaults associated with this account
+        const activeAcc = state.config.accounts.find(a => a.id === state.config.active_account_id) || state.config.accounts[0];
+        if (activeAcc && state.config.account_vaults[activeAcc.id] && state.config.account_vaults[activeAcc.id].length > 0) {
+          state.discoveredVaults = state.config.account_vaults[activeAcc.id];
+        } else if (Array.isArray(state.config.discovered_vaults) && state.config.discovered_vaults.length > 0) {
+          state.discoveredVaults = state.config.discovered_vaults;
+        }
+
+        // Auto-select first saved vault if vault_name is not configured yet
+        if (!state.config.vault_name && state.discoveredVaults && state.discoveredVaults.length > 0) {
+          state.config.vault_name = state.discoveredVaults[0].name;
+          state.config.vault_url = state.discoveredVaults[0].url;
+        } else if (state.config.vault_name && (!state.discoveredVaults || state.discoveredVaults.length === 0)) {
+          const vName = state.config.vault_name.trim();
+          const vUrl = state.config.vault_url?.trim() || `https://${vName}.vault.azure.net`;
+          state.discoveredVaults = [{ name: vName, url: vUrl, location: "saved-vault" }];
+        }
       }
     } catch (err) {
       self.kraken.log("Failed to parse KV config: " + (err.message || err));
+    }
+  }
+
+  // Load persistent Account-to-Vault registry from SQLite/KV store
+  await loadAccountVaultRegistry();
+
+  // If active account exists and vault is still empty, restore from database registry
+  const activeAcc = getActiveAccount();
+  const emailKey = (activeAcc?.email || "").toLowerCase().trim();
+  const savedVault = (emailKey ? state.accountVaultRegistry[emailKey] : null) || state.accountVaultRegistry["__last_configured__"];
+  if (savedVault && savedVault.vault_name) {
+    if (!state.config.vault_name) {
+      state.config.vault_name = savedVault.vault_name;
+      state.config.vault_url = savedVault.vault_url || `https://${savedVault.vault_name}.vault.azure.net`;
+    }
+    if (!state.config.tenant_id && savedVault.tenant_id) {
+      state.config.tenant_id = savedVault.tenant_id;
+    }
+    if (!state.discoveredVaults || state.discoveredVaults.length === 0) {
+      state.discoveredVaults = savedVault.discovered_vaults || [{
+        name: savedVault.vault_name,
+        url: state.config.vault_url,
+        location: "saved-vault"
+      }];
     }
   }
 }
@@ -404,12 +606,20 @@ async function discoverUserVaults(autoSelectIfSingle) {
         return { name, url, location };
       });
 
+      if (!state.config.account_vaults) {
+        state.config.account_vaults = {};
+      }
+      if (activeAcc && activeAcc.id) {
+        state.config.account_vaults[activeAcc.id] = state.discoveredVaults;
+      }
+      state.config.discovered_vaults = state.discoveredVaults;
+
       if (autoSelectIfSingle && (!state.config.vault_name || state.config.vault_name.trim() === "")) {
         const target = state.discoveredVaults[0];
         state.config.vault_name = target.name;
         state.config.vault_url = target.url;
-        await persistConfig();
       }
+      await persistConfig();
 
       state.message = {
         type: "success",
@@ -535,6 +745,23 @@ async function performPollCheck(isAutomatic) {
         state.config.auth_method = "user_account";
         if (!state.config.tenant_id && newAcc.tenant_id && newAcc.tenant_id !== "common") {
           state.config.tenant_id = newAcc.tenant_id;
+        }
+
+        // Auto-restore saved vault for this Microsoft account from database registry
+        const emailKey = (newAcc.email || "").toLowerCase().trim();
+        const savedVault = (emailKey ? state.accountVaultRegistry[emailKey] : null) || state.accountVaultRegistry["__last_configured__"];
+        if (savedVault && savedVault.vault_name) {
+          state.config.vault_name = savedVault.vault_name;
+          state.config.vault_url = savedVault.vault_url || `https://${savedVault.vault_name}.vault.azure.net`;
+          if (savedVault.tenant_id && !state.config.tenant_id) {
+            state.config.tenant_id = savedVault.tenant_id;
+          }
+          state.discoveredVaults = savedVault.discovered_vaults || [{
+            name: savedVault.vault_name,
+            url: state.config.vault_url,
+            location: "saved-vault"
+          }];
+          state.config.discovered_vaults = state.discoveredVaults;
         }
 
         state.deviceLogin.completed = true;
@@ -787,231 +1014,6 @@ function renderServerTab() {
 }
 
 // -------------------------------------------------------------
-// Interactive 5-Column Single-Line Secrets Table (CustomShadowHtml)
-// -------------------------------------------------------------
-
-function renderSecretsTableHtml(pageSecrets) {
-  const clickHandler = `(async function(e) {
-  var btn = e.target.closest("button[data-action]");
-  if (!btn) return;
-  var action = btn.getAttribute("data-action");
-  var secretName = btn.getAttribute("data-secret-name");
-  if (!action || !secretName) return;
-
-  var tr = btn.closest("tr");
-  if (!tr) return;
-  var input = tr.querySelector("input[data-secret-name]");
-  if (!input) return;
-
-  var showBtn = tr.querySelector("button[data-action=\x27toggle-show\x27]");
-  var copyBtn = tr.querySelector("button[data-action=\x27copy\x27]");
-
-  async function fetchSecretValue() {
-    var token = (window.localStorage && (window.localStorage.getItem("kraken_auth_token") || window.localStorage.getItem("token") || window.localStorage.getItem("auth_token"))) || "";
-    var port8080Url = window.location.protocol + "//" + window.location.hostname + ":8080/api/plugins/com.kraken.azure-keyvault/call";
-    var localUrl = window.location.origin + "/api/plugins/com.kraken.azure-keyvault/call";
-    var endpoints = [port8080Url, localUrl];
-
-    var attempt = 0;
-    while (attempt !== 4) {
-      attempt++;
-      for (var u = 0; u !== endpoints.length; u++) {
-        var url = endpoints[u];
-        try {
-          var resp = await fetch(url, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              ...(token ? { "Authorization": "Bearer " + token } : {})
-            },
-            body: JSON.stringify({
-              action: "get_secret",
-              payload: { secret_name: secretName }
-            })
-          });
-
-          var text = await resp.text();
-          var data = null;
-          try {
-            data = JSON.parse(text);
-          } catch (e) {
-            continue;
-          }
-
-          var resData = data && data.result ? data.result : data;
-          if (resData && resData.data && !resData.data.error) {
-            var val = resData.data.value !== undefined ? resData.data.value : (resData.data.secret || "");
-            return val;
-          }
-          var errStr = String(data ? (data.error || resData.error || (resData.data && resData.data.error && resData.data.error.message) || "") : "");
-          if (errStr.indexOf("not instantiated") !== -1 || errStr.indexOf("failed to instantiate") !== -1) {
-            break;
-          }
-          if (u === endpoints.length - 1 && attempt === 4) {
-            throw new Error(errStr || "Falha ao buscar secret");
-          }
-        } catch (err) {
-          if (u === endpoints.length - 1 && attempt === 4) {
-            throw err;
-          }
-        }
-      }
-      await new Promise(function(resolve) { setTimeout(resolve, 200 * attempt); });
-    }
-    return "";
-  }
-
-  if (action === "toggle-show") {
-    var currentVal = input.getAttribute("data-secret-val");
-    if (input.type === "text") {
-      input.type = "password";
-      input.value = "••••••••••••••••";
-      btn.innerText = "👁️";
-      btn.title = "Mostrar segredo";
-    } else {
-      if (currentVal !== null && currentVal !== undefined) {
-        input.type = "text";
-        input.value = currentVal;
-        btn.innerText = "🙈";
-        btn.title = "Ocultar segredo";
-      } else {
-        var oldText = btn.innerText;
-        btn.innerText = "⏳";
-        btn.disabled = true;
-        try {
-          var val = await fetchSecretValue();
-          input.setAttribute("data-secret-val", val);
-          input.type = "text";
-          input.value = val;
-          btn.innerText = "🙈";
-          btn.title = "Ocultar segredo";
-        } catch (err) {
-          alert("Erro ao buscar secret " + secretName + ": " + (err.message || err));
-          btn.innerText = oldText;
-        } finally {
-          btn.disabled = false;
-        }
-      }
-    }
-  } else if (action === "copy") {
-    var valToCopy = input.getAttribute("data-secret-val");
-    if (valToCopy === null || valToCopy === undefined) {
-      var oldCopyText = btn.innerText;
-      btn.innerText = "⏳";
-      btn.disabled = true;
-      try {
-        valToCopy = await fetchSecretValue();
-        input.setAttribute("data-secret-val", valToCopy);
-      } catch (err) {
-        alert("Erro ao buscar secret " + secretName + " para cópia: " + (err.message || err));
-        btn.innerText = oldCopyText;
-        btn.disabled = false;
-        return;
-      }
-      btn.disabled = false;
-    }
-
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(valToCopy);
-      } else {
-        input.type = "text";
-        input.value = valToCopy;
-        input.select();
-        document.execCommand("copy");
-        input.type = "password";
-        input.value = "••••••••••••••••";
-      }
-      btn.innerText = "✅";
-      setTimeout(function() { btn.innerText = "📋"; }, 3000);
-
-      setTimeout(function() {
-        try {
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText("");
-          }
-        } catch (_) {}
-      }, 30000);
-    } catch (clipErr) {
-      alert("Não foi possível copiar automaticamente para o clipboard. Revelando campo para cópia manual.");
-      input.type = "text";
-      input.value = valToCopy;
-      if (showBtn) showBtn.innerText = "🙈";
-    }
-  }
-})(event)`.replace(/"/g, "&quot;");
-
-  let rows = "";
-  for (const s of pageSecrets) {
-    const isEnabled = s.enabled !== false;
-    const statusDot = isEnabled ? "🟢" : "🔴";
-    const statusTitle = isEnabled ? "Ativo no Azure Key Vault" : "Desativado/Inativo no Azure Key Vault";
-    const tagsArr = s.tags && typeof s.tags === "object" ? Object.entries(s.tags) : [];
-    const tagsHtml = tagsArr.length > 0 
-      ? `<div style="font-size: 11px; color: #94a3b8; margin-top: 2px; white-space: normal;">${tagsArr.map(([k, v]) => `<span style="background: rgba(148,163,184,0.12); padding: 1px 5px; border-radius: 3px; margin-right: 4px; display: inline-block;">#${escapeHtml(k)}: ${escapeHtml(v)}</span>`).join("")}</div>`
-      : "";
-
-    rows += `
-      <tr style="border-bottom: 1px solid rgba(255,255,255,0.06); transition: background 0.15s;" onmouseover="this.style.background='rgba(255,255,255,0.03)'" onmouseout="this.style.background='transparent'">
-        <td style="width: 36px; text-align: center; padding: 10px 8px; vertical-align: middle;">
-          <span title="${statusTitle}" style="font-size: 14px; cursor: help; user-select: none;">${statusDot}</span>
-        </td>
-        <td style="padding: 10px 12px; vertical-align: middle;">
-          <div style="font-weight: 600; font-size: 13px; color: #f1f5f9; font-family: monospace; letter-spacing: 0.3px;">${escapeHtml(s.name)}</div>
-          ${tagsHtml}
-        </td>
-        <td style="width: 210px; padding: 10px 8px; vertical-align: middle;">
-          <input type="password" 
-                 readonly 
-                 value="••••••••••••••••" 
-                 data-secret-name="${escapeHtml(s.name)}"
-                 oncopy="setTimeout(function(){ try { navigator.clipboard.writeText(''); } catch(e){} }, 30000);"
-                 style="width: 100%; max-width: 200px; background: rgba(15, 23, 42, 0.85); border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 6px; padding: 5px 10px; color: #f8fafc; font-family: monospace; font-size: 12px; letter-spacing: 1.5px; outline: none; box-sizing: border-box;" 
-                 title="Valor do secret (clique em 👁️ para mostrar ou 📋 para copiar)" />
-        </td>
-        <td style="width: 46px; text-align: right; padding: 10px 6px; vertical-align: middle;">
-          <button type="button" 
-                  data-action="toggle-show" 
-                  data-secret-name="${escapeHtml(s.name)}" 
-                  title="Mostrar / Ocultar secret" 
-                  style="background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; width: 34px; height: 32px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; font-size: 14px; transition: all 0.15s;" 
-                  onmouseover="this.style.background='rgba(255,255,255,0.12)'" 
-                  onmouseout="this.style.background='rgba(255,255,255,0.06)'">👁️</button>
-        </td>
-        <td style="width: 46px; text-align: right; padding: 10px 8px 10px 4px; vertical-align: middle;">
-          <button type="button" 
-                  data-action="copy" 
-                  data-secret-name="${escapeHtml(s.name)}" 
-                  title="Copiar secret para a área de transferência (auto-limpa em 30s)" 
-                  style="background: #0284c7; border: none; border-radius: 6px; width: 34px; height: 32px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; font-size: 14px; transition: all 0.15s;" 
-                  onmouseover="this.style.background='#0369a1'" 
-                  onmouseout="this.style.background='#0284c7'">📋</button>
-        </td>
-      </tr>
-    `;
-  }
-
-  return `
-    <div onclick="${clickHandler}" style="width: 100%; overflow-x: auto; background: rgba(15, 23, 42, 0.4); border: 1px solid rgba(51, 65, 85, 0.6); border-radius: 8px;">
-      <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; color: #cbd5e1;">
-        <thead>
-          <tr style="background: rgba(15, 23, 42, 0.9); border-bottom: 1px solid rgba(51, 65, 85, 0.8); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #94a3b8;">
-            <th style="width: 36px; padding: 10px 8px; text-align: center;">Status</th>
-            <th style="padding: 10px 12px;">Nome do Segredo</th>
-            <th style="width: 210px; padding: 10px 8px;">Valor Mascarado</th>
-            <th style="width: 46px; padding: 10px 6px; text-align: right;">Ver</th>
-            <th style="width: 46px; padding: 10px 10px 10px 4px; text-align: right;">Copiar</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows}
-        </tbody>
-      </table>
-    </div>
-  `;
-}
-
-// -------------------------------------------------------------
 // 3. Full Page Surface (Main Plugin Management Page)
 // -------------------------------------------------------------
 function renderFullPage() {
@@ -1090,11 +1092,167 @@ function renderFullPage() {
   const startIndex = (currentPage - 1) * pageSize;
   const pageSecrets = filteredSecrets.slice(startIndex, startIndex + pageSize);
 
+  // Bind dynamic event handlers for on-demand actions
+  const secretsToRegister = (state.secrets && state.secrets.length > 0) ? state.secrets : pageSecrets;
+  if (Array.isArray(secretsToRegister)) {
+    secretsToRegister.forEach(s => {
+      if (s && s.name) {
+        self.kraken.on(`btn-show-${s.name}`, () => handleToggleShowSecret(s.name));
+        self.kraken.on(`btn-copy-${s.name}`, () => handleCopySecret(s.name));
+        self.kraken.on(`btn-open-bind-${s.name}`, () => handleOpenBindModal(s.name));
+      }
+    });
+  }
+
   self.kraken.render({
     type: "Page",
     title: "Azure Key Vault Integration",
     description: "Gerenciamento seguro de credenciais de servidores em nuvem com resolução Just-in-Time (JIT) e zero armazenamento local.",
     children: [
+      // Bind Secret Modal Dialog (Existing Server or Create New Server)
+      ...(state.bindModal.isOpen ? [{
+        type: "Modal",
+        id: "modal_bind_secret",
+        open: true,
+        title: `🔗 Vincular Segredo: ${state.bindModal.secretName}`,
+        description: "Associe este secret do Azure Key Vault a um servidor existente ou cadastre um novo servidor no Kraken (Zero DB Plaintext).",
+        onCloseId: "btn-bind-modal-close",
+        children: [
+          // Inner Alerts
+          ...(state.bindModal.errorMessage ? [{
+            type: "Alert",
+            title: "Erro ao processar",
+            description: state.bindModal.errorMessage,
+            variant: "destructive"
+          }] : []),
+          ...(state.bindModal.successMessage ? [{
+            type: "Alert",
+            title: "Sucesso",
+            description: state.bindModal.successMessage,
+            variant: "success"
+          }] : []),
+
+          // Mode Toggle
+          {
+            type: "FieldGroup",
+            children: [
+              {
+                type: "Button",
+                id: "btn-modal-mode-existing",
+                title: "🖥️ Servidor Existente",
+                variant: state.bindModal.mode === "existing" ? "default" : "outline"
+              },
+              {
+                type: "Button",
+                id: "btn-modal-mode-new",
+                title: "➕ Cadastrar Novo Servidor",
+                variant: state.bindModal.mode === "new_server" ? "default" : "outline"
+              }
+            ]
+          },
+
+          // Mode 1: Vincular a Servidor Existente
+          ...(state.bindModal.mode === "existing" ? [
+            {
+              type: "Select",
+              id: "bind_modal_server_id",
+              label: "Servidor Cadastrado no Kraken",
+              description: "O Kraken resolverá a senha deste servidor dinamicamente através do Azure Key Vault.",
+              value: state.bindModal.selectedServerId,
+              options: state.servers.map(s => ({
+                value: String(s.id),
+                label: `${s.name} (${s.hostname})`
+              }))
+            },
+            {
+              type: "FieldGroup",
+              children: [
+                {
+                  type: "Button",
+                  id: "btn-bind-modal-save",
+                  title: state.bindModal.isSubmitting ? "Salvando..." : "Salvar Vínculo",
+                  variant: "default",
+                  disabled: state.bindModal.isSubmitting || state.servers.length === 0
+                },
+                {
+                  type: "Button",
+                  id: "btn-bind-modal-close",
+                  title: "Cancelar",
+                  variant: "outline"
+                }
+              ]
+            }
+          ] : []),
+
+          // Mode 2: Cadastrar Novo Servidor no Kraken
+          ...(state.bindModal.mode === "new_server" ? [
+            {
+              type: "Input",
+              id: "bind_modal_new_name",
+              label: "Nome do Servidor no Kraken",
+              placeholder: "ex: srv-web-prod-01",
+              value: state.bindModal.newServerName
+            },
+            {
+              type: "Select",
+              id: "bind_modal_new_type",
+              label: "Tipo de Conexão",
+              value: state.bindModal.newServerType,
+              options: [
+                { value: "ssh", label: "SSH (Host Linux / Docker via SSH)" },
+                { value: "tcp", label: "TCP Direto (Docker Socket Remoto / TLS)" }
+              ]
+            },
+            {
+              type: "FieldGroup",
+              children: [
+                {
+                  type: "Input",
+                  id: "bind_modal_new_host",
+                  label: "Endereço do Host (IP ou FQDN)",
+                  placeholder: "ex: 192.168.1.100 ou srv.local",
+                  value: state.bindModal.newServerHost
+                },
+                {
+                  type: "Input",
+                  id: "bind_modal_new_port",
+                  label: "Porta",
+                  placeholder: state.bindModal.newServerType === "tcp" ? "2376" : "22",
+                  value: state.bindModal.newServerPort
+                }
+              ]
+            },
+            ...(state.bindModal.newServerType === "ssh" ? [
+              {
+                type: "Input",
+                id: "bind_modal_new_user",
+                label: "Nome de Usuário (SSH User)",
+                placeholder: "root",
+                value: state.bindModal.newServerUser
+              }
+            ] : []),
+            {
+              type: "FieldGroup",
+              children: [
+                {
+                  type: "Button",
+                  id: "btn-bind-modal-create-server",
+                  title: state.bindModal.isSubmitting ? "Cadastrando no Kraken..." : "Cadastrar Servidor e Vincular Secret",
+                  variant: "default",
+                  disabled: state.bindModal.isSubmitting
+                },
+                {
+                  type: "Button",
+                  id: "btn-bind-modal-close",
+                  title: "Cancelar",
+                  variant: "outline"
+                }
+              ]
+            }
+          ] : [])
+        ]
+      }] : []),
+
       // Notification Alert
       ...(state.message.text ? [{
         type: "Alert",
@@ -1444,6 +1602,155 @@ function renderFullPage() {
             ]
           },
 
+          // Active Bind & Register Server Panel (Appears immediately when clicking "🔗 Vincular")
+          ...(state.bindModal.isOpen ? [{
+            type: "Card",
+            id: "panel_bind_secret_inline",
+            title: `🔗 Painel de Vínculo: Segredo '${state.bindModal.secretName}'`,
+            description: "Associe este secret do Azure Key Vault a um servidor já existente no Kraken ou cadastre um novo servidor utilizando este secret como credencial segura (JIT - Zero DB Plaintext).",
+            children: [
+              ...(state.bindModal.errorMessage ? [{
+                type: "Alert",
+                title: "Atenção",
+                description: state.bindModal.errorMessage,
+                variant: "destructive"
+              }] : []),
+              ...(state.bindModal.successMessage ? [{
+                type: "Alert",
+                title: "Sucesso",
+                description: state.bindModal.successMessage,
+                variant: "success"
+              }] : []),
+              {
+                type: "FieldGroup",
+                children: [
+                  {
+                    type: "Button",
+                    id: "btn-modal-mode-existing",
+                    title: state.bindModal.mode === "existing" ? "🖥️ Servidor Existente (Ativo)" : "🖥️ Vincular a Servidor Existente",
+                    variant: state.bindModal.mode === "existing" ? "default" : "outline"
+                  },
+                  {
+                    type: "Button",
+                    id: "btn-modal-mode-new",
+                    title: state.bindModal.mode === "new_server" ? "➕ Cadastrar Novo Servidor (Ativo)" : "➕ Cadastrar Novo Servidor no Kraken",
+                    variant: state.bindModal.mode === "new_server" ? "default" : "outline"
+                  },
+                  {
+                    type: "Button",
+                    id: "btn-bind-modal-close",
+                    title: "✕ Fechar Painel",
+                    variant: "outline"
+                  }
+                ]
+              },
+              ...(state.bindModal.mode === "existing" ? [
+                {
+                  type: "Select",
+                  id: "bind_modal_server_id",
+                  label: "Selecione o Servidor Cadastrado no Kraken",
+                  description: "O Kraken resolverá a autenticação deste servidor através do Azure Key Vault.",
+                  value: state.bindModal.selectedServerId,
+                  options: state.servers.map(s => ({
+                    value: String(s.id),
+                    label: `${s.name} (${s.hostname || s.host_url})`
+                  }))
+                },
+                {
+                  type: "FieldGroup",
+                  children: [
+                    {
+                      type: "Button",
+                      id: "btn-bind-modal-save",
+                      title: state.bindModal.isSubmitting ? "Salvando..." : "🔗 Confirmar Vínculo",
+                      variant: "default",
+                      disabled: state.bindModal.isSubmitting || state.servers.length === 0
+                    },
+                    {
+                      type: "Button",
+                      id: "btn-bind-modal-close",
+                      title: "Cancelar",
+                      variant: "outline"
+                    }
+                  ]
+                }
+              ] : []),
+              ...(state.bindModal.mode === "new_server" ? [
+                {
+                  type: "Input",
+                  id: "bind_modal_new_name",
+                  label: "Nome do Servidor no Kraken",
+                  placeholder: "ex: srv-web-prod-01",
+                  value: state.bindModal.newServerName,
+                  description: "Identificador amigável do servidor que aparecerá na lista de servidores do Kraken."
+                },
+                {
+                  type: "Select",
+                  id: "bind_modal_new_type",
+                  label: "Tipo de Conexão",
+                  value: state.bindModal.newServerType,
+                  options: [
+                    { value: "ssh", label: "SSH (Host Linux / Docker via SSH)" },
+                    { value: "tcp", label: "TCP Direto (Docker Socket Remoto / TLS)" }
+                  ]
+                },
+                {
+                  type: "FieldGroup",
+                  children: [
+                    {
+                      type: "Input",
+                      id: "bind_modal_new_host",
+                      label: "Endereço do Host (IP ou FQDN)",
+                      placeholder: "ex: 192.168.1.100 ou srv.empresa.com",
+                      value: state.bindModal.newServerHost
+                    },
+                    {
+                      type: "Input",
+                      id: "bind_modal_new_port",
+                      label: "Porta",
+                      placeholder: state.bindModal.newServerType === "tcp" ? "2376" : "22",
+                      value: state.bindModal.newServerPort
+                    }
+                  ]
+                },
+                ...(state.bindModal.newServerType === "ssh" ? [
+                  {
+                    type: "Input",
+                    id: "bind_modal_new_user",
+                    label: "Nome de Usuário (SSH User)",
+                    placeholder: "root",
+                    value: state.bindModal.newServerUser,
+                    description: "Usuário para login SSH (ex: root, ubuntu, azureuser)."
+                  }
+                ] : []),
+                {
+                  type: "Alert",
+                  title: "Segurança JIT (Zero DB Plaintext)",
+                  description: `A autenticação deste servidor usará sob demanda o secret '${state.bindModal.secretName}' do Azure Key Vault. Nenhuma credencial em texto plano é salva no banco.`,
+                  variant: "info"
+                },
+                {
+                  type: "FieldGroup",
+                  children: [
+                    {
+                      type: "Button",
+                      id: "btn-bind-modal-create-server",
+                      title: state.bindModal.isSubmitting ? "Cadastrando no Kraken..." : "➕ Cadastrar Servidor no Kraken & Vincular Secret",
+                      variant: "default",
+                      disabled: state.bindModal.isSubmitting
+                    },
+                    {
+                      type: "Button",
+                      id: "btn-bind-modal-close",
+                      title: "Cancelar",
+                      variant: "outline"
+                    }
+                  ]
+                }
+              ] : [])
+            ]
+          }] : []),
+
           // Active Clipboard Auto-clear Countdown Banner
           ...(state.clipboardNotice ? [{
             type: "Alert",
@@ -1494,15 +1801,79 @@ function renderFullPage() {
             ]
           }] : []),
 
-          // Secrets Table (CustomShadowHtml): strictly 1-line 5-column responsive table
-          // Col 1: Status dot (🟢 / 🔴)
-          // Col 2: Secret Name + Tags
-          // Col 3: Compact Masked Input (••••••••••••••••)
-          // Col 4: Show / Hide Eye Button (👁️ / 🙈)
-          // Col 5: Copy Button (📋 / ✅)
+          // Interactive 6-Column Secrets Table
           ...(pageSecrets.length > 0 ? [{
-            type: "CustomShadowHtml",
-            html: renderSecretsTableHtml(pageSecrets)
+            type: "Table",
+            id: "tbl_azure_kv_secrets",
+            columns: [
+              { key: "status", label: "Status", width: "70px", className: "text-center", cellClassName: "text-center" },
+              { key: "name", label: "Nome do Segredo", width: "230px" },
+              { key: "value", label: "Valor Mascarado / Revelado" },
+              { key: "bind", label: "Vincular", width: "95px", className: "text-center", cellClassName: "text-center" },
+              { key: "show", label: "Ver", width: "60px", className: "text-center", cellClassName: "text-center" },
+              { key: "copy", label: "Copiar", width: "60px", className: "text-center", cellClassName: "text-center" }
+            ],
+            rows: pageSecrets.map(s => {
+              const isEnabled = s.enabled !== false;
+              const isRevealed = Boolean(state.revealedSecrets && state.revealedSecrets[s.name] && !state.revealedSecrets[s.name].isMasked);
+              const revealedVal = (state.revealedSecrets && state.revealedSecrets[s.name] && state.revealedSecrets[s.name].value) || "";
+              const ver = (state.secretVersions && state.secretVersions[s.name]) || 0;
+              const isLoadingThis = state.loadingSecretName === s.name;
+              const isCopyLoadingThis = state.copyLoadingSecret === s.name;
+              const isCopiedThis = state.copiedSecretName === s.name;
+
+              const isBound = Boolean(
+                state.config.server_bindings &&
+                Object.values(state.config.server_bindings).some(v => v === s.name)
+              );
+
+              const tagKeys = s.tags ? Object.keys(s.tags) : [];
+              let tagSummary = "";
+              if (tagKeys.length === 1) {
+                tagSummary = `${tagKeys[0]}:${s.tags[tagKeys[0]]}`;
+              } else if (tagKeys.length > 1) {
+                tagSummary = `${tagKeys[0]}:${s.tags[tagKeys[0]]} (+${tagKeys.length - 1})`;
+              }
+              if (tagSummary.length > 25) {
+                tagSummary = tagSummary.slice(0, 22) + "...";
+              }
+
+              return {
+                status: isEnabled ? "🟢" : "🔴",
+                name: `🔑 ${s.name}${tagSummary ? ` [${tagSummary}]` : ""}`,
+                value: {
+                  type: "Input",
+                  id: isRevealed ? `sec_rev_${s.name}_v${ver}` : `sec_mask_${s.name}_v${ver}`,
+                  value: isRevealed ? revealedVal : "••••••••••••••••",
+                  inputType: isRevealed ? "text" : "password",
+                  readOnly: true
+                },
+                bind: {
+                  type: "Button",
+                  id: `btn-open-bind-${s.name}`,
+                  actionId: `btn-open-bind-${s.name}`,
+                  value: s.name,
+                  title: isBound ? "🔗 OK" : "🔗 Vincular",
+                  variant: isBound ? "secondary" : "outline",
+                  disabled: isLoadingThis || isCopyLoadingThis
+                },
+                show: {
+                  type: "Button",
+                  id: `btn-show-${s.name}`,
+                  title: isRevealed ? "🙈" : (isLoadingThis ? "⏳" : "👁️"),
+                  variant: isRevealed ? "secondary" : "outline",
+                  disabled: isLoadingThis || isCopyLoadingThis
+                },
+                copy: {
+                  type: "Button",
+                  id: `btn-copy-${s.name}`,
+                  copyText: revealedVal || undefined,
+                  title: isCopiedThis ? "✅" : (isCopyLoadingThis ? "⏳" : "📋"),
+                  variant: isCopiedThis ? "running" : "default",
+                  disabled: isLoadingThis || isCopyLoadingThis
+                }
+              };
+            })
           }] : [{
             type: "Alert",
             title: allSecrets.length === 0 ? "Nenhum segredo carregado" : "Nenhum segredo corresponde ao filtro",
@@ -1726,11 +2097,21 @@ self.kraken.on("btn-switch-account", async () => {
 
   const currentIdx = state.config.accounts.findIndex(a => a.id === state.config.active_account_id);
   const nextIdx = (currentIdx + 1) % state.config.accounts.length;
-  state.config.active_account_id = state.config.accounts[nextIdx].id;
+  const nextAcc = state.config.accounts[nextIdx];
+  state.config.active_account_id = nextAcc.id;
+
+  if (state.config.account_vaults && state.config.account_vaults[nextAcc.id] && state.config.account_vaults[nextAcc.id].length > 0) {
+    state.discoveredVaults = state.config.account_vaults[nextAcc.id];
+    const match = state.discoveredVaults.find(v => v.name.toLowerCase() === (state.config.vault_name || "").toLowerCase());
+    if (!match && state.discoveredVaults.length > 0) {
+      state.config.vault_name = state.discoveredVaults[0].name;
+      state.config.vault_url = state.discoveredVaults[0].url;
+    }
+  }
 
   state.message = {
     type: "success",
-    text: `Conta Microsoft ativa alterada para: ${state.config.accounts[nextIdx].name} (${state.config.accounts[nextIdx].email})`
+    text: `Conta Microsoft ativa alterada para: ${nextAcc.name} (${nextAcc.email})`
   };
   renderUI();
   await persistConfig();
@@ -1743,11 +2124,20 @@ self.kraken.on("btn-switch-account", async () => {
 
 // Disconnect Microsoft Account and clean credentials & secrets in memory and storage
 self.kraken.on("btn-remove-account", async () => {
-  const currentId = state.config.active_account_id;
-  state.config.accounts = state.config.accounts.filter(a => a.id !== currentId);
+  const activeAcc = getActiveAccount();
+  if (state.config.accounts.length <= 1 || !activeAcc) {
+    state.config.accounts = [];
+  } else {
+    state.config.accounts = state.config.accounts.filter(a => {
+      if (activeAcc.id && a.id === activeAcc.id) return false;
+      if (activeAcc.email && a.email && a.email.toLowerCase().trim() === activeAcc.email.toLowerCase().trim()) return false;
+      return true;
+    });
+  }
+
   state.config.active_account_id = state.config.accounts.length > 0 ? state.config.accounts[0].id : "";
 
-  // If no more accounts, clean vault secrets in memory and runtime
+  // If no more accounts, clean active vault session in memory and runtime
   if (state.config.accounts.length === 0) {
     state.secrets = [];
     state.discoveredVaults = [];
@@ -1755,6 +2145,8 @@ self.kraken.on("btn-remove-account", async () => {
     state.config.vault_name = "";
     state.config.vault_url = "";
     state.config.tenant_id = "";
+    state.config.client_id = "";
+    state.config.client_secret = "";
     state.config.server_bindings = {};
     state.config.auto_convention = false;
     state.bindForm.secret_name = "";
@@ -1771,12 +2163,12 @@ self.kraken.on("btn-remove-account", async () => {
     }
     state.clipboardNotice = null;
     state.loadingSecretName = "";
-    await idbClear();
+    await idbRemove("azure_kv_config");
   }
 
   state.message = {
     type: "info",
-    text: "Conta Microsoft desconectada e dados do cofre limpos com sucesso."
+    text: "Conta Microsoft desconectada com sucesso."
   };
   renderUI();
   await persistConfig();
@@ -1818,7 +2210,7 @@ self.kraken.on("btn-clear-all-data", async () => {
     secret_name: "",
     create_new_secretValue: ""
   };
-  await idbClear();
+  await idbRemove("azure_kv_config");
 
   state.message = {
     type: "info",
@@ -1826,6 +2218,167 @@ self.kraken.on("btn-clear-all-data", async () => {
   };
   renderUI();
   await persistConfig();
+});
+
+// -------------------------------------------------------------
+// Bind Modal Event Listeners
+// -------------------------------------------------------------
+
+self.kraken.on("btn-modal-mode-existing", () => {
+  state.bindModal.mode = "existing";
+  state.bindModal.errorMessage = "";
+  renderUI();
+});
+
+self.kraken.on("btn-modal-mode-new", () => {
+  state.bindModal.mode = "new_server";
+  state.bindModal.errorMessage = "";
+  renderUI();
+});
+
+self.kraken.on("btn-bind-modal-close", () => {
+  state.bindModal.isOpen = false;
+  state.bindModal.errorMessage = "";
+  state.bindModal.successMessage = "";
+  state.bindModal.isSubmitting = false;
+  renderUI();
+});
+
+self.kraken.on("bind_modal_server_id", (payload) => {
+  if (payload && payload.value !== undefined) {
+    state.bindModal.selectedServerId = String(payload.value);
+  }
+});
+
+self.kraken.on("bind_modal_new_name", (payload) => {
+  if (payload && payload.value !== undefined) {
+    state.bindModal.newServerName = String(payload.value).trim();
+  }
+});
+
+self.kraken.on("bind_modal_new_type", (payload) => {
+  if (payload && payload.value !== undefined) {
+    state.bindModal.newServerType = String(payload.value);
+    if (!state.bindModal.newServerPort || state.bindModal.newServerPort === "22" || state.bindModal.newServerPort === "2376") {
+      state.bindModal.newServerPort = state.bindModal.newServerType === "tcp" ? "2376" : "22";
+    }
+    renderUI();
+  }
+});
+
+self.kraken.on("bind_modal_new_host", (payload) => {
+  if (payload && payload.value !== undefined) {
+    state.bindModal.newServerHost = String(payload.value).trim();
+  }
+});
+
+self.kraken.on("bind_modal_new_port", (payload) => {
+  if (payload && payload.value !== undefined) {
+    state.bindModal.newServerPort = String(payload.value).trim();
+  }
+});
+
+self.kraken.on("bind_modal_new_user", (payload) => {
+  if (payload && payload.value !== undefined) {
+    state.bindModal.newServerUser = String(payload.value).trim();
+  }
+});
+
+self.kraken.on("btn-bind-modal-save", async (payload) => {
+  const form = payload?.formData || payload || self.kraken.formData || {};
+  const srvId = String(form.bind_modal_server_id || state.bindModal.selectedServerId || (state.servers[0]?.id ?? ""));
+  const srv = state.servers.find(s => String(s.id) === srvId);
+  if (!srv) {
+    state.bindModal.errorMessage = "Selecione um servidor válido para vincular.";
+    renderUI();
+    return;
+  }
+
+  const secretName = state.bindModal.secretName;
+  if (!state.config.server_bindings) state.config.server_bindings = {};
+  state.config.server_bindings[srv.id] = secretName;
+  if (srv.hostname) state.config.server_bindings[srv.hostname] = secretName;
+  if (srv.name) state.config.server_bindings[srv.name] = secretName;
+
+  await persistConfig();
+  state.bindModal.isOpen = false;
+  state.message = {
+    type: "success",
+    text: `Servidor '${srv.name}' vinculado com sucesso ao secret '${secretName}'.`
+  };
+  renderUI();
+});
+
+self.kraken.on("btn-bind-modal-create-server", async (payload) => {
+  const form = payload?.formData || payload || self.kraken.formData || {};
+  const serverName = String(form.bind_modal_new_name || state.bindModal.newServerName || "").trim();
+  const connType = String(form.bind_modal_new_type || state.bindModal.newServerType || "ssh");
+  const host = String(form.bind_modal_new_host || state.bindModal.newServerHost || "").trim();
+  const port = String(form.bind_modal_new_port || state.bindModal.newServerPort || (connType === "tcp" ? "2376" : "22")).trim();
+  const user = String(form.bind_modal_new_user || state.bindModal.newServerUser || "root").trim();
+  const secretName = state.bindModal.secretName;
+
+  if (!serverName) {
+    state.bindModal.errorMessage = "Informe o nome do servidor no Kraken.";
+    renderUI();
+    return;
+  }
+  if (!host) {
+    state.bindModal.errorMessage = "Informe o endereço do host (IP ou FQDN).";
+    renderUI();
+    return;
+  }
+
+  state.bindModal.isSubmitting = true;
+  state.bindModal.errorMessage = "";
+  renderUI();
+
+  try {
+    const hostUrl = connType === "tcp"
+      ? `tcp://${host}:${port || "2376"}`
+      : `ssh://${user || "root"}@${host}:${port || "22"}`;
+
+    const createPayload = {
+      name: serverName,
+      host_url: hostUrl,
+      server_host: host,
+      server_port: port || (connType === "tcp" ? "2376" : "22"),
+      ssh_user: connType === "ssh" ? user : "",
+      ssh_auth_method: connType === "ssh" ? "password" : "",
+      credential_source: "plugin",
+      credential_plugin_id: "com.kraken.azure-keyvault",
+      secret_reference: secretName,
+      credential_policy: "save_securely"
+    };
+
+    const res = await requestCreateServer(createPayload);
+    if (res && res.success) {
+      const createdSrv = res.server;
+      if (!state.config.server_bindings) state.config.server_bindings = {};
+      if (createdSrv?.id) state.config.server_bindings[String(createdSrv.id)] = secretName;
+      state.config.server_bindings[serverName] = secretName;
+      state.config.server_bindings[host] = secretName;
+
+      await persistConfig();
+      await loadMonitoredServers();
+
+      state.bindModal.isOpen = false;
+      state.bindModal.isSubmitting = false;
+      state.message = {
+        type: "success",
+        text: `Novo servidor '${serverName}' cadastrado com sucesso no Kraken e vinculado ao secret '${secretName}'!`
+      };
+      renderUI();
+    } else {
+      state.bindModal.errorMessage = res?.error || "Falha ao cadastrar novo servidor no Kraken.";
+      state.bindModal.isSubmitting = false;
+      renderUI();
+    }
+  } catch (err) {
+    state.bindModal.errorMessage = "Erro inesperado ao cadastrar servidor: " + (err.message || err);
+    state.bindModal.isSubmitting = false;
+    renderUI();
+  }
 });
 
 // Synchronize inputs
@@ -1850,9 +2403,24 @@ self.kraken.on("cfg_discovered_vault_select", async (payload) => {
     } else {
       state.config.vault_url = `https://${selectedName}.vault.azure.net`;
     }
+    const activeAcc = getActiveAccount();
+    registerAccountVault(activeAcc?.email, selectedName, state.config.vault_url, state.config.tenant_id);
+    await saveAccountVaultRegistry();
     await persistConfig();
     renderUI();
     await performTestConnection(false);
+  }
+});
+
+self.kraken.on("cfg_vault_name", (payload) => {
+  if (payload && payload.value !== undefined) {
+    state.config.vault_name = String(payload.value).trim();
+  }
+});
+
+self.kraken.on("cfg_vault_url", (payload) => {
+  if (payload && payload.value !== undefined) {
+    state.config.vault_url = String(payload.value).trim();
   }
 });
 
@@ -1888,6 +2456,25 @@ self.kraken.on("btn-save-config", async (payload) => {
     if (form.cfg_client_id !== undefined) state.config.client_id = String(form.cfg_client_id || "").trim();
     if (form.cfg_client_secret && form.cfg_client_secret !== "••••••••••••••••") {
       state.config.client_secret = String(form.cfg_client_secret).trim();
+    }
+
+    if (state.config.vault_name) {
+      const activeAcc = getActiveAccount();
+      const vName = state.config.vault_name.trim();
+      const vUrl = state.config.vault_url?.trim() || `https://${vName}.vault.azure.net`;
+      if (!state.discoveredVaults) state.discoveredVaults = [];
+      if (!state.discoveredVaults.some(v => v.name.toLowerCase() === vName.toLowerCase())) {
+        state.discoveredVaults.push({ name: vName, url: vUrl, location: "saved-vault" });
+      }
+      if (!state.config.account_vaults) state.config.account_vaults = {};
+      if (activeAcc && activeAcc.id) {
+        state.config.account_vaults[activeAcc.id] = state.discoveredVaults;
+      }
+      state.config.discovered_vaults = state.discoveredVaults;
+
+      // Persist in account vault registry in SQLite/KV store
+      registerAccountVault(activeAcc?.email, vName, vUrl, state.config.tenant_id);
+      await saveAccountVaultRegistry();
     }
 
     await persistConfig();
@@ -2081,6 +2668,25 @@ async function performTestConnection(silentOnMissingVault, payload) {
       }
       state.secretsTable.currentPage = 1;
 
+      // Persist successfully tested vault associated with user account in SQLite/KV store
+      if (state.config.vault_name) {
+        const activeAcc = getActiveAccount();
+        const vName = state.config.vault_name.trim();
+        const vUrl = state.config.vault_url?.trim() || `https://${vName}.vault.azure.net`;
+        if (!state.discoveredVaults) state.discoveredVaults = [];
+        if (!state.discoveredVaults.some(v => v.name.toLowerCase() === vName.toLowerCase())) {
+          state.discoveredVaults.push({ name: vName, url: vUrl, location: "saved-vault" });
+        }
+        if (!state.config.account_vaults) state.config.account_vaults = {};
+        if (activeAcc && activeAcc.id) {
+          state.config.account_vaults[activeAcc.id] = state.discoveredVaults;
+        }
+        state.config.discovered_vaults = state.discoveredVaults;
+        registerAccountVault(activeAcc?.email, vName, vUrl, state.config.tenant_id);
+        await saveAccountVaultRegistry();
+        await persistConfig();
+      }
+
       state.testResult = {
         success: true,
         message: `Conectado com sucesso ao cofre '${state.config.vault_name || state.config.vault_url}' (total de ${state.secrets.length} segredos listados).`
@@ -2183,6 +2789,7 @@ async function handleToggleShowSecret(secretName) {
   // If currently revealed and visible, clicking Ocultar hides it
   if (state.revealedSecrets[secretName] && !state.revealedSecrets[secretName].isMasked) {
     state.revealedSecrets[secretName].isMasked = true;
+    state.secretVersions[secretName] = (state.secretVersions[secretName] || 0) + 1;
     renderUI();
     return;
   }
@@ -2195,18 +2802,27 @@ async function handleToggleShowSecret(secretName) {
     return;
   }
 
-  // Not in memory yet -> fetch from Azure Key Vault
+  // Not in memory yet -> fetch on-demand directly from Azure Key Vault API
   state.loadingSecretName = secretName;
   renderUI();
 
   try {
     const res = await callBackendAction("get_secret", {
       config: state.config,
-      secret_name: secretName
+      secret_name: secretName,
+      vault_name: state.config.vault_name,
+      vault_url: state.config.vault_url
     });
 
     if (res && res.data && !res.data.error && res.status !== "error") {
-      const secretVal = res.data.value !== undefined ? res.data.value : (res.data.secret || "");
+      let secretVal = "";
+      if (res.data.value !== undefined) {
+        secretVal = String(res.data.value);
+      } else if (res.data.secret !== undefined) {
+        secretVal = String(res.data.secret);
+      } else if (typeof res.data === "string") {
+        secretVal = res.data;
+      }
       state.revealedSecrets[secretName] = {
         value: secretVal,
         isMasked: false
@@ -2237,6 +2853,8 @@ async function handleCopySecret(secretName) {
   let secretVal = "";
   if (state.revealedSecrets[secretName] && state.revealedSecrets[secretName].value) {
     secretVal = state.revealedSecrets[secretName].value;
+    state.revealedSecrets[secretName].isMasked = false;
+    state.secretVersions[secretName] = (state.secretVersions[secretName] || 0) + 1;
   } else {
     state.copyLoadingSecret = secretName;
     renderUI();
@@ -2244,15 +2862,24 @@ async function handleCopySecret(secretName) {
     try {
       const res = await callBackendAction("get_secret", {
         config: state.config,
-        secret_name: secretName
+        secret_name: secretName,
+        vault_name: state.config.vault_name,
+        vault_url: state.config.vault_url
       });
 
       if (res && res.data && !res.data.error && res.status !== "error") {
-        secretVal = res.data.value !== undefined ? res.data.value : (res.data.secret || "");
+        if (res.data.value !== undefined) {
+          secretVal = String(res.data.value);
+        } else if (res.data.secret !== undefined) {
+          secretVal = String(res.data.secret);
+        } else if (typeof res.data === "string") {
+          secretVal = res.data;
+        }
         state.revealedSecrets[secretName] = {
           value: secretVal,
-          isMasked: true // keep masked in textfield unless user also clicked Mostrar
+          isMasked: false
         };
+        state.secretVersions[secretName] = (state.secretVersions[secretName] || 0) + 1;
       } else {
         const errMsg = res?.error || res?.data?.error?.message || "Falha ao obter secret.";
         state.message = { type: "error", text: `Erro ao obter secret '${secretName}': ${errMsg}` };
@@ -2270,17 +2897,34 @@ async function handleCopySecret(secretName) {
     }
   }
 
-  // Attempt writing to clipboard
+  // Copy to system clipboard via main thread Window context
+  try {
+    self.postMessage({
+      type: "KRAKEN_COPY_CLIPBOARD",
+      text: secretVal,
+      autoClearAfterMs: 30000
+    });
+  } catch (_) {}
+
+  // Fallback attempt within worker if supported
   try {
     if (self.navigator && self.navigator.clipboard && self.navigator.clipboard.writeText) {
-      self.navigator.clipboard.writeText(secretVal)
-        .then(() => self.kraken.log("Secret copiado para área de transferência."))
-        .catch((e) => self.kraken.log("Aviso de escrita no clipboard: " + e));
+      self.navigator.clipboard.writeText(secretVal).catch(() => {});
     }
   } catch (_) {}
 
-  // Visual feedback: button changes to "✅ Copiado!" for 3 seconds
+  // Visual feedback: button changes to "✅" for 3 seconds
   state.copiedSecretName = secretName;
+
+  // Active clipboard countdown with auto-clear in 30s
+  if (state.clipboardInterval) {
+    clearInterval(state.clipboardInterval);
+    state.clipboardInterval = null;
+  }
+  state.clipboardNotice = {
+    name: secretName,
+    remainingSec: 30
+  };
   renderUI();
 
   if (state.copiedSecretTimeout) {
@@ -2292,6 +2936,26 @@ async function handleCopySecret(secretName) {
       renderUI();
     }
   }, 3000);
+
+  state.clipboardInterval = setInterval(() => {
+    if (!state.clipboardNotice) {
+      clearInterval(state.clipboardInterval);
+      state.clipboardInterval = null;
+      return;
+    }
+    state.clipboardNotice.remainingSec--;
+    if (state.clipboardNotice.remainingSec <= 0) {
+      clearInterval(state.clipboardInterval);
+      state.clipboardInterval = null;
+      state.clipboardNotice = null;
+      try {
+        if (self.navigator && self.navigator.clipboard && self.navigator.clipboard.writeText) {
+          self.navigator.clipboard.writeText("").catch(() => {});
+        }
+      } catch (_) {}
+    }
+    renderUI();
+  }, 1000);
 }
 
 // Server detail tab: save binding

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 	"unsafe"
@@ -107,17 +108,19 @@ type MicrosoftAccount struct {
 
 // Config defines the Azure Key Vault and binding configuration
 type Config struct {
-	AuthMethod      string             `json:"auth_method"` // "user_account", "service_principal", "managed_identity", "azure_cli"
-	TenantID        string             `json:"tenant_id,omitempty"`
-	ClientID        string             `json:"client_id,omitempty"`
-	ClientSecret    string             `json:"client_secret,omitempty"`
-	VaultName       string             `json:"vault_name"` // e.g. "my-company-kv"
-	VaultURL        string             `json:"vault_url,omitempty"`
-	AutoConvention  bool               `json:"auto_convention"`          // e.g. srv-{hostname}-pwd
-	NamingPattern   string             `json:"naming_pattern,omitempty"` // default: "srv-{hostname}-pwd"
-	ServerBindings  map[string]string  `json:"server_bindings,omitempty"`
-	ActiveAccountID string             `json:"active_account_id,omitempty"`
-	Accounts        []MicrosoftAccount `json:"accounts,omitempty"`
+	AuthMethod       string                 `json:"auth_method"` // "user_account", "service_principal", "managed_identity", "azure_cli"
+	TenantID         string                 `json:"tenant_id,omitempty"`
+	ClientID         string                 `json:"client_id,omitempty"`
+	ClientSecret     string                 `json:"client_secret,omitempty"`
+	VaultName        string                 `json:"vault_name"` // e.g. "my-company-kv"
+	VaultURL         string                 `json:"vault_url,omitempty"`
+	AutoConvention   bool                   `json:"auto_convention"`          // e.g. srv-{hostname}-pwd
+	NamingPattern    string                 `json:"naming_pattern,omitempty"` // default: "srv-{hostname}-pwd"
+	ServerBindings   map[string]string      `json:"server_bindings,omitempty"`
+	ActiveAccountID  string                 `json:"active_account_id,omitempty"`
+	Accounts         []MicrosoftAccount     `json:"accounts,omitempty"`
+	DiscoveredVaults []any                  `json:"discovered_vaults,omitempty"`
+	AccountVaults    map[string]interface{} `json:"account_vaults,omitempty"`
 }
 
 func wipeString(s *string) {
@@ -139,6 +142,12 @@ func loadPersistedConfig() Config {
 	return cfg
 }
 
+var (
+	vaultHostRegex  = regexp.MustCompile(`^[a-zA-Z0-9-]+\.(vault\.azure\.net|vault\.azure\.cn|vault\.usgovcloudapi\.net)$`)
+	vaultNameRegex  = regexp.MustCompile(`^[a-zA-Z0-9-]{3,24}$`)
+	secretNameRegex = regexp.MustCompile(`^[a-zA-Z0-9-]{1,127}$`)
+)
+
 func mergeWithPersistedConfig(incoming *Config) Config {
 	persisted := loadPersistedConfig()
 	if incoming == nil {
@@ -150,23 +159,8 @@ func mergeWithPersistedConfig(incoming *Config) Config {
 	if strings.TrimSpace(incoming.VaultURL) != "" {
 		persisted.VaultURL = strings.TrimSpace(incoming.VaultURL)
 	}
-	if strings.TrimSpace(incoming.AuthMethod) != "" {
-		persisted.AuthMethod = strings.TrimSpace(incoming.AuthMethod)
-	}
-	if strings.TrimSpace(incoming.TenantID) != "" {
-		persisted.TenantID = strings.TrimSpace(incoming.TenantID)
-	}
-	if strings.TrimSpace(incoming.ClientID) != "" {
-		persisted.ClientID = strings.TrimSpace(incoming.ClientID)
-	}
-	if strings.TrimSpace(incoming.ClientSecret) != "" {
-		persisted.ClientSecret = strings.TrimSpace(incoming.ClientSecret)
-	}
 	if strings.TrimSpace(incoming.ActiveAccountID) != "" {
 		persisted.ActiveAccountID = strings.TrimSpace(incoming.ActiveAccountID)
-	}
-	if len(incoming.Accounts) > 0 {
-		persisted.Accounts = incoming.Accounts
 	}
 	if len(incoming.ServerBindings) > 0 {
 		if persisted.ServerBindings == nil {
@@ -176,23 +170,44 @@ func mergeWithPersistedConfig(incoming *Config) Config {
 			persisted.ServerBindings[k] = v
 		}
 	}
+	// NOTE: Accounts, ClientSecret, TenantID, and AuthMethod are strictly retained from persisted
+	// storage to prevent configuration injection, credential exfiltration, and SSRF attacks.
 	return persisted
 }
 
-func getVaultBaseURL(cfg *Config) string {
-	if cfg.VaultURL != "" {
+func getVaultBaseURL(cfg *Config) (string, error) {
+	if cfg == nil {
+		return "", fmt.Errorf("configuração do Key Vault ausente")
+	}
+
+	if strings.TrimSpace(cfg.VaultURL) != "" {
 		u := strings.TrimSpace(cfg.VaultURL)
-		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		if strings.HasPrefix(u, "http://") {
+			return "", fmt.Errorf("protocolo inseguro HTTP não permitido para Azure Key Vault: %s", u)
+		}
+		if !strings.HasPrefix(u, "https://") {
 			u = "https://" + u
 		}
-		return strings.TrimRight(u, "/")
+		parsed, err := url.Parse(u)
+		if err != nil {
+			return "", fmt.Errorf("URL do Azure Key Vault inválida: %w", err)
+		}
+		host := strings.ToLower(parsed.Hostname())
+		if !vaultHostRegex.MatchString(host) {
+			return "", fmt.Errorf("host inválido para Azure Key Vault: '%s'. O host deve ser um subdomínio válido de .vault.azure.net", host)
+		}
+		return fmt.Sprintf("https://%s", host), nil
 	}
+
 	name := strings.TrimSpace(cfg.VaultName)
 	name = strings.TrimPrefix(name, "https://")
 	name = strings.TrimPrefix(name, "http://")
 	name = strings.TrimSuffix(name, ".vault.azure.net")
 	name = strings.TrimRight(name, "/")
-	return fmt.Sprintf("https://%s.vault.azure.net", name)
+	if !vaultNameRegex.MatchString(name) {
+		return "", fmt.Errorf("nome de Key Vault inválido: '%s'. Deve conter de 3 a 24 caracteres alfanuméricos ou hífens", name)
+	}
+	return fmt.Sprintf("https://%s.vault.azure.net", name), nil
 }
 
 func getEffectiveClientID(cfg *Config) string {
@@ -571,7 +586,11 @@ printf '{"subscriptions":%%s,"vaults":[%%s]}' "$SUBS_JSON" "$ALL_ITEMS_ACC"
 			break
 		}
 
-		vaultURL := getVaultBaseURL(&cfg)
+		vaultURL, vaultErr := getVaultBaseURL(&cfg)
+		if vaultErr != nil {
+			resp = Response{Status: "error", Error: vaultErr.Error()}
+			break
+		}
 		paginationCmd := fmt.Sprintf(`%s
 VAULT_BASE_URL=%s
 
@@ -679,6 +698,10 @@ fi`,
 			resp = Response{Status: "error", Error: "O nome do segredo é obrigatório."}
 			break
 		}
+		if !secretNameRegex.MatchString(secretName) {
+			resp = Response{Status: "error", Error: fmt.Sprintf("Nome de segredo inválido '%s'. Deve conter apenas caracteres alfanuméricos e hífens.", secretName)}
+			break
+		}
 		if strings.TrimSpace(putReq.Value) == "" {
 			resp = Response{Status: "error", Error: "O valor do segredo não pode ser vazio."}
 			break
@@ -704,7 +727,11 @@ fi`,
 		bodyJSON, _ := json.Marshal(bodyMap)
 		b64Body := base64.StdEncoding.EncodeToString(bodyJSON)
 
-		vaultURL := getVaultBaseURL(&cfg)
+		vaultURL, vaultErr := getVaultBaseURL(&cfg)
+		if vaultErr != nil {
+			resp = Response{Status: "error", Error: vaultErr.Error()}
+			break
+		}
 		targetURL := fmt.Sprintf("%s/secrets/%s?api-version=7.4", vaultURL, url.PathEscape(secretName))
 
 		cmd := fmt.Sprintf("%s\nprintf '%%s' %s | base64 -d | curl -s -X PUT -H \"Authorization: Bearer $AKV_TOKEN\" -H 'Content-Type: application/json' --data-binary @- %s",
@@ -788,13 +815,25 @@ fi`,
 			break
 		}
 
+		if !secretNameRegex.MatchString(secretName) {
+			resp = Response{
+				Status: "error",
+				Error:  fmt.Sprintf("Nome de secret inválido '%s'.", secretName),
+			}
+			break
+		}
+
 		authScript, authErr := buildAuthTokenScript(&cfg)
 		if authErr != nil {
 			resp = Response{Status: "error", Error: authErr.Error()}
 			break
 		}
 
-		vaultURL := getVaultBaseURL(&cfg)
+		vaultURL, vaultErr := getVaultBaseURL(&cfg)
+		if vaultErr != nil {
+			resp = Response{Status: "error", Error: vaultErr.Error()}
+			break
+		}
 		targetURL := fmt.Sprintf("%s/secrets/%s?api-version=7.4", vaultURL, url.PathEscape(secretName))
 
 		cmd := fmt.Sprintf("%s\ncurl -s -H \"Authorization: Bearer $AKV_TOKEN\" %s",

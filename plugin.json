@@ -21,7 +21,8 @@
     "credentials:resolve",
     "credentials:manage",
     "hosts:read",
-    "hosts:exec"
+    "hosts:exec",
+    "hosts:create"
   ],
   "allowed_hosts": [
     "login.microsoftonline.com",
