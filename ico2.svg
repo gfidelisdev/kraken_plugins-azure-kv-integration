@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="vault" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#35A7F2"/>
+      <stop offset="1" stop-color="#0866B5"/>
+    </linearGradient>
+  </defs>
+  <!-- Vault body -->
+  <rect x="14" y="18" width="100" height="92" rx="17" fill="url(#vault)"/>
+  <rect x="23" y="27" width="82" height="74" rx="11" fill="none" stroke="#DDF3FF" stroke-width="4" opacity=".95"/>
+  <!-- Vault door -->
+  <circle cx="64" cy="64" r="25" fill="#0B4F89" stroke="#DDF3FF" stroke-width="4"/>
+  <circle cx="64" cy="64" r="16" fill="none" stroke="#7CCBFA" stroke-width="4"/>
+  <circle cx="64" cy="64" r="5" fill="#DDF3FF"/>
+  <!-- Key overlay -->
+  <g transform="translate(76 77) rotate(-42)">
+    <circle cx="0" cy="0" r="12" fill="#FFD166" stroke="#704B12" stroke-width="3"/>
+    <circle cx="0" cy="0" r="4" fill="#0B4F89"/>
+    <path d="M9 8 L31 30 L25 36 L19 30 L14 35 L8 29 L13 24 L4 15 Z" fill="#FFD166" stroke="#704B12" stroke-width="3" stroke-linejoin="round"/>
+  </g>
+</svg>

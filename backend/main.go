@@ -22,27 +22,53 @@ func hostKVGet(keyPtr, keyLen, outPtr, maxOutLen uint32) uint32
 //go:wasmimport kraken kraken_kv_set
 func hostKVSet(keyPtr, keyLen, valPtr, valLen uint32) uint32
 
-func wasmKVGet(key string) string {
-	if key == "" {
-		return ""
+//go:wasmimport kraken kraken_auth_get_token
+func hostAuthGetToken(scopePtr, scopeLen, outPtr, maxOutLen uint32) uint32
+
+func wasmGetMicrosoftSessionToken(scope string) (string, *MicrosoftAccount) {
+	if scope == "" {
+		return "", nil
 	}
-	scopedKey := key
-	if !strings.HasPrefix(scopedKey, "com.kraken.azure-keyvault:") {
-		scopedKey = "com.kraken.azure-keyvault:" + key
-	}
-	keyBytes := []byte(scopedKey)
-	outBuf := make([]byte, 512*1024)
-	n := hostKVGet(
-		uint32(uintptr(unsafe.Pointer(&keyBytes[0]))),
-		uint32(len(keyBytes)),
+	scopeBytes := []byte(scope)
+	outBuf := make([]byte, 64*1024)
+	n := hostAuthGetToken(
+		uint32(uintptr(unsafe.Pointer(&scopeBytes[0]))),
+		uint32(len(scopeBytes)),
 		uint32(uintptr(unsafe.Pointer(&outBuf[0]))),
 		uint32(len(outBuf)),
 	)
 	if n == 0 {
-		rawKeyBytes := []byte(key)
+		return "", nil
+	}
+	var res struct {
+		AccessToken string            `json:"access_token"`
+		Account     *MicrosoftAccount `json:"account"`
+	}
+	if err := json.Unmarshal(outBuf[:n], &res); err != nil {
+		return "", nil
+	}
+	return strings.TrimSpace(res.AccessToken), res.Account
+}
+
+func wasmKVGet(key string) string {
+	if key == "" {
+		return ""
+	}
+	rawKey := strings.TrimPrefix(key, "com.kraken.azure-keyvault:")
+	rawKeyBytes := []byte(rawKey)
+	outBuf := make([]byte, 512*1024)
+	n := hostKVGet(
+		uint32(uintptr(unsafe.Pointer(&rawKeyBytes[0]))),
+		uint32(len(rawKeyBytes)),
+		uint32(uintptr(unsafe.Pointer(&outBuf[0]))),
+		uint32(len(outBuf)),
+	)
+	if n == 0 {
+		scopedKey := "com.kraken.azure-keyvault:" + rawKey
+		keyBytes := []byte(scopedKey)
 		n = hostKVGet(
-			uint32(uintptr(unsafe.Pointer(&rawKeyBytes[0]))),
-			uint32(len(rawKeyBytes)),
+			uint32(uintptr(unsafe.Pointer(&keyBytes[0]))),
+			uint32(len(keyBytes)),
 			uint32(uintptr(unsafe.Pointer(&outBuf[0]))),
 			uint32(len(outBuf)),
 		)
@@ -57,16 +83,24 @@ func wasmKVSet(key, val string) error {
 	if key == "" {
 		return fmt.Errorf("empty key")
 	}
-	scopedKey := key
-	if !strings.HasPrefix(scopedKey, "com.kraken.azure-keyvault:") {
-		scopedKey = "com.kraken.azure-keyvault:" + key
-	}
-	keyBytes := []byte(scopedKey)
+	rawKey := strings.TrimPrefix(key, "com.kraken.azure-keyvault:")
+	scopedKey := "com.kraken.azure-keyvault:" + rawKey
+
 	valBytes := []byte(val)
 	var valPtr uint32
 	if len(valBytes) > 0 {
 		valPtr = uint32(uintptr(unsafe.Pointer(&valBytes[0])))
 	}
+
+	rawKeyBytes := []byte(rawKey)
+	_ = hostKVSet(
+		uint32(uintptr(unsafe.Pointer(&rawKeyBytes[0]))),
+		uint32(len(rawKeyBytes)),
+		valPtr,
+		uint32(len(valBytes)),
+	)
+
+	keyBytes := []byte(scopedKey)
 	rc := hostKVSet(
 		uint32(uintptr(unsafe.Pointer(&keyBytes[0]))),
 		uint32(len(keyBytes)),
@@ -118,6 +152,7 @@ type Config struct {
 	NamingPattern    string                 `json:"naming_pattern,omitempty"` // default: "srv-{hostname}-pwd"
 	ServerBindings   map[string]string      `json:"server_bindings,omitempty"`
 	ActiveAccountID  string                 `json:"active_account_id,omitempty"`
+	UserDisconnected bool                   `json:"user_disconnected,omitempty"`
 	Accounts         []MicrosoftAccount     `json:"accounts,omitempty"`
 	DiscoveredVaults []any                  `json:"discovered_vaults,omitempty"`
 	AccountVaults    map[string]interface{} `json:"account_vaults,omitempty"`
@@ -151,6 +186,12 @@ var (
 func mergeWithPersistedConfig(incoming *Config) Config {
 	persisted := loadPersistedConfig()
 	if incoming == nil {
+		return persisted
+	}
+	if incoming.UserDisconnected {
+		persisted.UserDisconnected = true
+		persisted.Accounts = nil
+		persisted.ActiveAccountID = ""
 		return persisted
 	}
 	if strings.TrimSpace(incoming.VaultName) != "" {
@@ -224,13 +265,19 @@ func getEffectiveTenantID(cfg *Config) string {
 	return "common"
 }
 
-func resolveSecretName(cfg *Config, serverID, hostname string) string {
+func resolveSecretName(cfg *Config, serverID, serverName, hostname string) string {
+	trimmedName := strings.TrimSpace(serverName)
+	strippedSrvName := strings.TrimPrefix(trimmedName, "srv-")
+	trimmedHost := strings.TrimSpace(hostname)
+
 	if cfg.ServerBindings != nil {
-		if mapped, ok := cfg.ServerBindings[serverID]; ok && mapped != "" {
-			return mapped
-		}
-		if mapped, ok := cfg.ServerBindings[hostname]; ok && mapped != "" {
-			return mapped
+		for _, candidate := range []string{serverID, trimmedName, strippedSrvName, trimmedHost} {
+			if candidate == "" {
+				continue
+			}
+			if mapped, ok := cfg.ServerBindings[candidate]; ok && strings.TrimSpace(mapped) != "" {
+				return strings.TrimSpace(mapped)
+			}
 		}
 	}
 
@@ -239,7 +286,10 @@ func resolveSecretName(cfg *Config, serverID, hostname string) string {
 		if pattern == "" {
 			pattern = "srv-{hostname}-pwd"
 		}
-		cleanHost := strings.ToLower(strings.TrimSpace(hostname))
+		cleanHost := strings.ToLower(trimmedHost)
+		if cleanHost == "" {
+			cleanHost = strings.ToLower(strippedSrvName)
+		}
 		cleanHost = strings.ReplaceAll(cleanHost, ".", "-")
 		cleanHost = strings.ReplaceAll(cleanHost, ":", "-")
 
@@ -263,6 +313,18 @@ func getActiveAccount(cfg *Config) *MicrosoftAccount {
 	return &cfg.Accounts[0]
 }
 
+func findExplicitStandaloneAccount(cfg *Config) *MicrosoftAccount {
+	if cfg == nil || len(cfg.Accounts) == 0 || cfg.ActiveAccountID == "" || cfg.ActiveAccountID == "kraken-ms-session" {
+		return nil
+	}
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == cfg.ActiveAccountID && cfg.Accounts[i].Source != "kraken_session" {
+			return &cfg.Accounts[i]
+		}
+	}
+	return nil
+}
+
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
@@ -276,9 +338,23 @@ func buildAuthTokenScript(cfg *Config) (string, error) {
 
 	switch method {
 	case "user_account":
-		acc := getActiveAccount(cfg)
-		if acc == nil {
+		if cfg.UserDisconnected {
 			return "", fmt.Errorf("Nenhuma conta Microsoft conectada. Clique em 'Conectar Conta Microsoft' primeiro.")
+		}
+		// 1. If an explicit standalone account was not chosen, check if Kraken Admin Tool has an active Microsoft session
+		standaloneAcc := findExplicitStandaloneAccount(cfg)
+		if standaloneAcc == nil {
+			if sessionToken, _ := wasmGetMicrosoftSessionToken("https://vault.azure.net/.default"); sessionToken != "" {
+				return fmt.Sprintf("AKV_TOKEN=%s", shellQuote(sessionToken)), nil
+			}
+		}
+
+		acc := standaloneAcc
+		if acc == nil {
+			acc = getActiveAccount(cfg)
+		}
+		if acc == nil {
+			return "", fmt.Errorf("Nenhuma conta Microsoft conectada. Clique em 'Conectar Conta Microsoft' primeiro ou efetue login no Kraken com conta Microsoft.")
 		}
 		tok := strings.TrimSpace(acc.AccessToken)
 		if tok == "" {
@@ -292,7 +368,7 @@ func buildAuthTokenScript(cfg *Config) (string, error) {
 		clientID := getEffectiveClientID(cfg)
 
 		now := time.Now().Unix()
-		if refreshTok != "" && (tok == "" || (acc.ExpiresAt > 0 && acc.ExpiresAt <= now+120)) {
+		if refreshTok != "" && (tok == "" || now <= 0 || acc.ExpiresAt <= 0 || acc.ExpiresAt <= now+300) {
 			return fmt.Sprintf(`AKV_REFRESH_JSON=$(curl -s -X POST %s --data-urlencode 'grant_type=refresh_token' --data-urlencode %s --data-urlencode %s --data-urlencode 'scope=https://vault.azure.net/.default openid profile email offline_access')
 AKV_TOKEN=$(printf '%%s' "$AKV_REFRESH_JSON" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 if [ -z "$AKV_TOKEN" ]; then AKV_TOKEN=%s; fi`,
@@ -346,7 +422,21 @@ func buildARMTokenScript(cfg *Config) (string, error) {
 
 	switch method {
 	case "user_account":
-		acc := getActiveAccount(cfg)
+		if cfg.UserDisconnected {
+			return "", fmt.Errorf("Nenhuma conta Microsoft conectada. Clique em 'Conectar Conta Microsoft' primeiro.")
+		}
+		// 1. If an explicit standalone account was not chosen, check if Kraken Admin Tool has an active Microsoft session
+		standaloneAcc := findExplicitStandaloneAccount(cfg)
+		if standaloneAcc == nil {
+			if sessionToken, _ := wasmGetMicrosoftSessionToken("https://management.azure.com/.default"); sessionToken != "" {
+				return fmt.Sprintf("ARM_TOKEN=%s", shellQuote(sessionToken)), nil
+			}
+		}
+
+		acc := standaloneAcc
+		if acc == nil {
+			acc = getActiveAccount(cfg)
+		}
 		if acc == nil {
 			return "", fmt.Errorf("Nenhuma conta Microsoft conectada.")
 		}
@@ -449,6 +539,29 @@ func main() {
 			Status: "needs_host_adapter",
 			Data: map[string]interface{}{
 				"operation": "hosts.list",
+			},
+		}
+
+	case "bind_host_secret", "hosts.bind_credential":
+		var p struct {
+			ServerID   interface{} `json:"server_id"`
+			SecretName string      `json:"secret_name"`
+		}
+		_ = json.Unmarshal(req.Payload, &p)
+		resp = Response{
+			Status: "needs_host_adapter",
+			Data: map[string]interface{}{
+				"operation":   "hosts.bind_credential",
+				"server_id":   p.ServerID,
+				"secret_name": p.SecretName,
+			},
+		}
+
+	case "auth.logout", "auth.disconnect":
+		resp = Response{
+			Status: "needs_host_adapter",
+			Data: map[string]interface{}{
+				"operation": "auth.logout",
 			},
 		}
 
@@ -800,11 +913,11 @@ fi`,
 			secretName = strings.TrimSpace(resolveReq.SecretReference)
 		}
 		if secretName == "" {
-			secretName = resolveSecretName(&cfg, serverIDStr, hostname)
+			secretName = resolveSecretName(&cfg, serverIDStr, resolveReq.ServerName, hostname)
 		}
 		if strings.Contains(secretName, "/secrets/") {
 			parts := strings.Split(secretName, "/secrets/")
-			secretName = parts[len(parts)-1]
+			secretName = strings.Split(parts[len(parts)-1], "/")[0]
 		}
 
 		if secretName == "" {

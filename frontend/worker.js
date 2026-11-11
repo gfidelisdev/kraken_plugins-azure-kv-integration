@@ -16,6 +16,7 @@ const state = {
     naming_pattern: "srv-{hostname}-pwd",
     server_bindings: {}, // serverId -> secretName
     active_account_id: "",
+    user_disconnected: false,
     accounts: [] // [{ id, email, name, tenant_id, source, token, access_token, refresh_token, expires_at }]
   },
   accountVaultRegistry: {}, // email / __last_configured__ -> { vault_name, vault_url, tenant_id, discovered_vaults, updated_at }
@@ -119,89 +120,32 @@ function escapeHtml(str) {
 }
 
 // -------------------------------------------------------------
-// IndexedDB Helper for Web Worker
+// Legacy Browser IndexedDB Purge (Zero Browser Credential Persistence)
 // -------------------------------------------------------------
 
-function openLocalIDB() {
-  return new Promise((resolve) => {
-    if (!self.indexedDB) {
-      resolve(null);
-      return;
+function purgeLegacyLocalIDB() {
+  try {
+    if (self.indexedDB && typeof self.indexedDB.deleteDatabase === "function") {
+      self.indexedDB.deleteDatabase("kraken_azure_kv_plugin_db");
     }
-    try {
-      const req = self.indexedDB.open("kraken_azure_kv_plugin_db", 1);
-      req.onupgradeneeded = (e) => {
-        const db = e.target.result;
-        if (!db.objectStoreNames.contains("kv")) {
-          db.createObjectStore("kv");
-        }
-      };
-      req.onsuccess = (e) => resolve(e.target.result);
-      req.onerror = () => resolve(null);
-    } catch (_) {
-      resolve(null);
-    }
-  });
+  } catch (_) {}
 }
 
-async function idbGet(key) {
-  const db = await openLocalIDB();
-  if (!db) return null;
-  return new Promise((resolve) => {
-    try {
-      const tx = db.transaction("kv", "readonly");
-      const req = tx.objectStore("kv").get(key);
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => resolve(null);
-    } catch (_) {
-      resolve(null);
-    }
-  });
+async function idbGet(_key) {
+  purgeLegacyLocalIDB();
+  return null;
 }
 
-async function idbSet(key, val) {
-  const db = await openLocalIDB();
-  if (!db) return;
-  return new Promise((resolve) => {
-    try {
-      const tx = db.transaction("kv", "readwrite");
-      tx.objectStore("kv").put(val, key);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    } catch (_) {
-      resolve();
-    }
-  });
+async function idbSet(_key, _val) {
+  purgeLegacyLocalIDB();
 }
 
 async function idbClear() {
-  const db = await openLocalIDB();
-  if (!db) return;
-  return new Promise((resolve) => {
-    try {
-      const tx = db.transaction("kv", "readwrite");
-      tx.objectStore("kv").clear();
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    } catch (_) {
-      resolve();
-    }
-  });
+  purgeLegacyLocalIDB();
 }
 
-async function idbRemove(key) {
-  const db = await openLocalIDB();
-  if (!db) return;
-  return new Promise((resolve) => {
-    try {
-      const tx = db.transaction("kv", "readwrite");
-      tx.objectStore("kv").delete(key);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    } catch (_) {
-      resolve();
-    }
-  });
+async function idbRemove(_key) {
+  purgeLegacyLocalIDB();
 }
 
 // -------------------------------------------------------------
@@ -214,28 +158,19 @@ async function loadAccountVaultRegistry() {
     if (raw) {
       const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
       if (parsed && typeof parsed === "object") {
-        state.accountVaultRegistry = { ...state.accountVaultRegistry, ...parsed };
+        state.accountVaultRegistry = { ...parsed };
       }
+    } else {
+      state.accountVaultRegistry = {};
     }
   } catch (err) {
     self.kraken.log("Fallback ao carregar registro de cofres do backend: " + (err.message || err));
   }
-
-  try {
-    const idbRaw = await idbGet("account_vault_registry");
-    if (idbRaw) {
-      const parsed = typeof idbRaw === "string" ? JSON.parse(idbRaw) : idbRaw;
-      if (parsed && typeof parsed === "object") {
-        state.accountVaultRegistry = { ...parsed, ...state.accountVaultRegistry };
-      }
-    }
-  } catch (_) {}
 }
 
 async function saveAccountVaultRegistry() {
   try {
     const serialized = JSON.stringify(state.accountVaultRegistry);
-    await idbSet("account_vault_registry", serialized);
     await self.kraken.kv.set("account_vault_registry", serialized);
   } catch (err) {
     self.kraken.log("Erro ao salvar registro de cofres no backend: " + (err.message || err));
@@ -261,7 +196,6 @@ function registerAccountVault(email, vaultName, vaultUrl, tenantId) {
   if (email && typeof email === "string" && email.trim() !== "") {
     state.accountVaultRegistry[email.toLowerCase().trim()] = entry;
   }
-  state.accountVaultRegistry["__last_configured__"] = entry;
 }
 
 // -------------------------------------------------------------
@@ -402,7 +336,7 @@ function detectKrakenUser() {
   const provider = String(user.auth_provider || user.provider || "").toLowerCase();
   const email = String(user.email || user.username || "").toLowerCase();
 
-  const isMsProvider = provider.includes("microsoft") || provider.includes("azure") || provider.includes("entra") || provider.includes("office365");
+  const isMsProvider = provider === "microsoft" || provider.includes("microsoft") || provider.includes("azure") || provider.includes("entra") || provider.includes("office365");
   const isMsDomain = email.endsWith("@outlook.com") ||
                      email.endsWith("@hotmail.com") ||
                      email.endsWith("@live.com") ||
@@ -410,6 +344,84 @@ function detectKrakenUser() {
                      email.includes(".onmicrosoft.com");
 
   state.isKrakenUserMicrosoft = isMsProvider || isMsDomain;
+
+  // If the user has explicitly disconnected, DO NOT auto-inject or auto-connect!
+  if (state.config.user_disconnected) {
+    state.config.accounts = (state.config.accounts || []).filter(a => a.source !== "kraken_session");
+    if (state.config.active_account_id === "kraken-ms-session") {
+      state.config.active_account_id = state.config.accounts.length > 0 ? state.config.accounts[0].id : "";
+    }
+    if (state.config.accounts.length === 0) {
+      state.config.active_account_id = "";
+      state.config.vault_name = "";
+      state.config.vault_url = "";
+      state.discoveredVaults = [];
+      state.config.auto_convention = false;
+    }
+    return;
+  }
+
+  // Handle ephemeral Microsoft SSO session account injection
+  if (!Array.isArray(state.config.accounts)) {
+    state.config.accounts = [];
+  }
+
+  if (isMsProvider && user.microsoft_account) {
+    const msAcc = user.microsoft_account;
+    const sessionAcc = {
+      id: msAcc.id || "kraken-ms-session",
+      name: msAcc.name || user.username || "Kraken Microsoft Account",
+      email: msAcc.email || user.email,
+      tenant_id: msAcc.tenant_id || "common",
+      source: "kraken_session",
+    };
+
+    // Remove any existing kraken_session account
+    state.config.accounts = state.config.accounts.filter(a => a.source !== "kraken_session");
+    // Inject at the beginning
+    state.config.accounts.unshift(sessionAcc);
+
+    // If active_account_id is unset or was set to another kraken session, set to this session
+    if (!state.config.active_account_id || state.config.active_account_id === "kraken-ms-session") {
+      state.config.active_account_id = sessionAcc.id;
+    }
+
+    // Restore vault registry settings if vault is not yet configured
+    const emailKey = (sessionAcc.email || "").toLowerCase().trim();
+    const savedVault = emailKey ? state.accountVaultRegistry?.[emailKey] : null;
+    if (savedVault && savedVault.vault_name) {
+      if (!state.config.vault_name) {
+        state.config.vault_name = savedVault.vault_name;
+        state.config.vault_url = savedVault.vault_url || `https://${savedVault.vault_name}.vault.azure.net`;
+      }
+      if (!state.config.tenant_id && savedVault.tenant_id) {
+        state.config.tenant_id = savedVault.tenant_id;
+      }
+      if (!state.discoveredVaults || state.discoveredVaults.length === 0) {
+        state.discoveredVaults = savedVault.discovered_vaults || [{
+          name: savedVault.vault_name,
+          url: state.config.vault_url,
+          location: "saved-vault"
+        }];
+      }
+    }
+  } else if (!isMsProvider) {
+    // If signed in with local Kraken account, strip any ephemeral session accounts
+    state.config.accounts = (state.config.accounts || []).filter(a => a.source !== "kraken_session");
+    if (state.config.active_account_id === "kraken-ms-session") {
+      state.config.active_account_id = state.config.accounts.length > 0 ? state.config.accounts[0].id : "";
+    }
+    // If no accounts belong to this local user, ensure completely disconnected state
+    if (state.config.accounts.length === 0) {
+      state.config.active_account_id = "";
+      if (state.config.auth_method === "user_account") {
+        state.config.vault_name = "";
+        state.config.vault_url = "";
+        state.discoveredVaults = [];
+        state.config.auto_convention = false;
+      }
+    }
+  }
 }
 
 function getActiveAccount() {
@@ -430,7 +442,16 @@ function isKeyVaultOperable() {
 }
 
 async function persistConfig() {
-  const serialized = JSON.stringify(state.config);
+  // Strip ephemeral kraken_session accounts before persisting to IDB and backend KV
+  const cleanConfig = { ...state.config };
+  if (Array.isArray(cleanConfig.accounts)) {
+    cleanConfig.accounts = cleanConfig.accounts.filter(a => a.source !== "kraken_session");
+  }
+  if (cleanConfig.active_account_id === "kraken-ms-session") {
+    cleanConfig.active_account_id = cleanConfig.accounts && cleanConfig.accounts.length > 0 ? cleanConfig.accounts[0].id : "";
+  }
+
+  const serialized = JSON.stringify(cleanConfig);
   try {
     await idbSet("azure_kv_config", serialized);
   } catch (_) {}
@@ -465,6 +486,9 @@ async function loadConfig() {
       const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
       if (parsed && typeof parsed === "object") {
         state.config = { ...state.config, ...parsed };
+        if (parsed.user_disconnected !== undefined) {
+          state.config.user_disconnected = Boolean(parsed.user_disconnected);
+        }
         if (!state.config.server_bindings) state.config.server_bindings = {};
         if (!Array.isArray(state.config.accounts)) state.config.accounts = [];
         if (!state.config.account_vaults) state.config.account_vaults = {};
@@ -490,6 +514,21 @@ async function loadConfig() {
     } catch (err) {
       self.kraken.log("Failed to parse KV config: " + (err.message || err));
     }
+  } else {
+    state.config = {
+      auth_method: "user_account",
+      tenant_id: "",
+      client_id: "",
+      client_secret: "",
+      vault_name: "",
+      vault_url: "",
+      auto_convention: false,
+      naming_pattern: "srv-{hostname}-pwd",
+      server_bindings: {},
+      active_account_id: "",
+      accounts: []
+    };
+    state.discoveredVaults = [];
   }
 
   // Load persistent Account-to-Vault registry from SQLite/KV store
@@ -498,7 +537,7 @@ async function loadConfig() {
   // If active account exists and vault is still empty, restore from database registry
   const activeAcc = getActiveAccount();
   const emailKey = (activeAcc?.email || "").toLowerCase().trim();
-  const savedVault = (emailKey ? state.accountVaultRegistry[emailKey] : null) || state.accountVaultRegistry["__last_configured__"];
+  const savedVault = emailKey ? state.accountVaultRegistry[emailKey] : null;
   if (savedVault && savedVault.vault_name) {
     if (!state.config.vault_name) {
       state.config.vault_name = savedVault.vault_name;
@@ -749,7 +788,7 @@ async function performPollCheck(isAutomatic) {
 
         // Auto-restore saved vault for this Microsoft account from database registry
         const emailKey = (newAcc.email || "").toLowerCase().trim();
-        const savedVault = (emailKey ? state.accountVaultRegistry[emailKey] : null) || state.accountVaultRegistry["__last_configured__"];
+        const savedVault = emailKey ? state.accountVaultRegistry[emailKey] : null;
         if (savedVault && savedVault.vault_name) {
           state.config.vault_name = savedVault.vault_name;
           state.config.vault_url = savedVault.vault_url || `https://${savedVault.vault_name}.vault.azure.net`;
@@ -764,6 +803,7 @@ async function performPollCheck(isAutomatic) {
           state.config.discovered_vaults = state.discoveredVaults;
         }
 
+        state.config.user_disconnected = false;
         state.deviceLogin.completed = true;
         state.deviceLogin.active = false;
         state.deviceLogin.polling = false;
@@ -1373,11 +1413,17 @@ function renderFullPage() {
             {
               type: "FieldGroup",
               children: [
+                ...(state.isKrakenUserMicrosoft && !hasAccounts ? [{
+                  type: "Button",
+                  id: "btn-reconnect-sso",
+                  title: "🔑 Conectar com Minha Conta Microsoft (SSO)",
+                  variant: "default"
+                }] : []),
                 {
                   type: "Button",
                   id: "btn-connect-microsoft-account",
                   title: state.loading ? "Gerando Código Seguro..." : (hasAccounts ? "➕ Adicionar Outra Conta Microsoft (Janela)" : "🔑 Conectar Conta Microsoft (Abre Janela)"),
-                  variant: "default",
+                  variant: hasAccounts ? "outline" : (state.isKrakenUserMicrosoft ? "outline" : "default"),
                   disabled: state.loading
                 },
                 ...(hasAccounts && state.config.accounts.length > 1 ? [{
@@ -1931,11 +1977,11 @@ function renderFullPage() {
               {
                 type: "Input",
                 id: "bind_new_secret_value",
-                label: "Criar/Atualizar Valor da Senha no Azure KV (Opcional)",
-                placeholder: "Deixe em branco se o secret já existir no Azure Key Vault",
-                inputType: "password",
-                value: "",
-                description: "Se preenchido, envia a senha diretamente para o Azure Key Vault e descarta da memória imediatamente.",
+                label: "Criar Novo Valor no Azure KV (Apenas se o secret ainda não existir)",
+                placeholder: "Deixe em branco para usar o secret já existente no cofre",
+                inputType: "text",
+                value: state.bindForm.new_secret_value || "",
+                description: "Preencha apenas se desejar criar ou substituir o valor no Azure Key Vault.",
                 disabled: !operable
               }
             ]
@@ -2035,6 +2081,7 @@ function renderFullPage() {
 
 // Start Connection Flow with Microsoft Official Device Login Window via Host Adapter
 self.kraken.on("btn-connect-microsoft-account", async () => {
+  state.config.user_disconnected = false;
   stopPollingTimer();
   state.loading = true;
   state.message = { type: "", text: "" };
@@ -2125,53 +2172,58 @@ self.kraken.on("btn-switch-account", async () => {
 // Disconnect Microsoft Account and clean credentials & secrets in memory and storage
 self.kraken.on("btn-remove-account", async () => {
   const activeAcc = getActiveAccount();
-  if (state.config.accounts.length <= 1 || !activeAcc) {
-    state.config.accounts = [];
-  } else {
-    state.config.accounts = state.config.accounts.filter(a => {
-      if (activeAcc.id && a.id === activeAcc.id) return false;
-      if (activeAcc.email && a.email && a.email.toLowerCase().trim() === activeAcc.email.toLowerCase().trim()) return false;
-      return true;
-    });
+  const emailKey = (activeAcc?.email || "").toLowerCase().trim();
+  if (emailKey && state.accountVaultRegistry) {
+    delete state.accountVaultRegistry[emailKey];
+    try {
+      await saveAccountVaultRegistry();
+    } catch (_) {}
   }
 
-  state.config.active_account_id = state.config.accounts.length > 0 ? state.config.accounts[0].id : "";
+  state.config.user_disconnected = true;
+  state.config.accounts = [];
+  state.config.active_account_id = "";
+  state.secrets = [];
+  state.discoveredVaults = [];
+  state.testResult = null;
+  state.config.vault_name = "";
+  state.config.vault_url = "";
+  state.config.tenant_id = "";
+  state.config.client_id = "";
+  state.config.client_secret = "";
+  state.config.server_bindings = {};
+  state.config.auto_convention = false;
+  state.bindForm.secret_name = "";
+  state.revealedSecrets = {};
+  state.secretVersions = {};
+  state.copiedSecretName = "";
+  if (state.copiedSecretTimeout) {
+    clearTimeout(state.copiedSecretTimeout);
+    state.copiedSecretTimeout = null;
+  }
+  if (state.clipboardTimerInterval) {
+    clearInterval(state.clipboardTimerInterval);
+    state.clipboardTimerInterval = null;
+  }
+  state.clipboardNotice = null;
+  state.loadingSecretName = "";
 
-  // If no more accounts, clean active vault session in memory and runtime
-  if (state.config.accounts.length === 0) {
-    state.secrets = [];
-    state.discoveredVaults = [];
-    state.testResult = null;
-    state.config.vault_name = "";
-    state.config.vault_url = "";
-    state.config.tenant_id = "";
-    state.config.client_id = "";
-    state.config.client_secret = "";
-    state.config.server_bindings = {};
-    state.config.auto_convention = false;
-    state.bindForm.secret_name = "";
-    state.revealedSecrets = {};
-    state.secretVersions = {};
-    state.copiedSecretName = "";
-    if (state.copiedSecretTimeout) {
-      clearTimeout(state.copiedSecretTimeout);
-      state.copiedSecretTimeout = null;
-    }
-    if (state.clipboardTimerInterval) {
-      clearInterval(state.clipboardTimerInterval);
-      state.clipboardTimerInterval = null;
-    }
-    state.clipboardNotice = null;
-    state.loadingSecretName = "";
+  // Call backend to invalidate broker session
+  try {
+    await callBackendAction("auth.logout", {});
+  } catch (_) {}
+
+  try {
     await idbRemove("azure_kv_config");
-  }
+  } catch (_) {}
+
+  await persistConfig();
 
   state.message = {
     type: "info",
-    text: "Conta Microsoft desconectada com sucesso."
+    text: "Conta Microsoft desconectada com sucesso. A sessão foi revogada e permanecerá desconectada ao recarregar a página."
   };
   renderUI();
-  await persistConfig();
 });
 
 // Total Clean & Reset Button
@@ -2187,7 +2239,8 @@ self.kraken.on("btn-clear-all-data", async () => {
     naming_pattern: "srv-{hostname}-pwd",
     server_bindings: {},
     active_account_id: "",
-    accounts: []
+    accounts: [],
+    user_disconnected: true
   };
   state.secrets = [];
   state.discoveredVaults = [];
@@ -2210,14 +2263,46 @@ self.kraken.on("btn-clear-all-data", async () => {
     secret_name: "",
     create_new_secretValue: ""
   };
-  await idbRemove("azure_kv_config");
+  state.accountVaultRegistry = {};
+
+  // Call backend to invalidate broker session
+  try {
+    await callBackendAction("auth.logout", {});
+  } catch (_) {}
+
+  try {
+    await idbClear();
+  } catch (_) {}
+
+  try {
+    await self.kraken.kv.set("account_vault_registry", "{}");
+  } catch (_) {}
+
+  await persistConfig();
 
   state.message = {
     type: "info",
-    text: "Todos os dados locais e contas foram completamente limpos."
+    text: "Todos os dados locais e contas foram completamente limpos e a sessão foi revogada."
   };
   renderUI();
+});
+
+// Reconnect SSO Account if explicitly requested
+self.kraken.on("btn-reconnect-sso", async () => {
+  state.config.user_disconnected = false;
+  state.message = { type: "", text: "" };
+  detectKrakenUser();
   await persistConfig();
+  state.message = {
+    type: "success",
+    text: "Conta Microsoft reconectada com sucesso a partir da sessão ativa."
+  };
+  renderUI();
+
+  await discoverUserVaults(true);
+  if (state.config.vault_name || state.config.vault_url) {
+    await performTestConnection(true);
+  }
 });
 
 // -------------------------------------------------------------
@@ -2301,6 +2386,11 @@ self.kraken.on("btn-bind-modal-save", async (payload) => {
   if (srv.name) state.config.server_bindings[srv.name] = secretName;
 
   await persistConfig();
+
+  try {
+    await callBackendAction("bind_host_secret", { server_id: srv.id, secret_name: secretName });
+  } catch (_) {}
+
   state.bindModal.isOpen = false;
   state.message = {
     type: "success",
@@ -2498,6 +2588,10 @@ self.kraken.on("btn-save-convention", async (payload) => {
   renderUI();
 });
 
+self.kraken.on("bind_new_secret_value", (payload) => {
+  state.bindForm.new_secret_value = String(payload.value || "");
+});
+
 // Bind server to secret on main page
 self.kraken.on("btn-bind-server-secret", async (payload) => {
   state.saving = true;
@@ -2509,7 +2603,7 @@ self.kraken.on("btn-bind-server-secret", async (payload) => {
     const srvId = String(form.bind_server_id || state.bindForm.selected_server_id || (state.servers[0]?.id ?? ""));
     const srv = state.servers.find(s => String(s.id) === srvId);
     const secretName = String(form.bind_secret_name || form.bind_secret_select || state.bindForm.secret_name || "").trim();
-    let newSecretVal = String(form.bind_new_secret_value || "");
+    let newSecretVal = String(state.bindForm.new_secret_value || "").trim();
 
     if (!srvId) {
       state.message = { type: "error", text: "Selecione um servidor para vincular." };
@@ -2520,7 +2614,7 @@ self.kraken.on("btn-bind-server-secret", async (payload) => {
       return;
     }
 
-    if (newSecretVal.trim() !== "") {
+    if (newSecretVal !== "") {
       const putRes = await callBackendAction("put_secret", {
         config: state.config,
         name: secretName,
@@ -2533,6 +2627,7 @@ self.kraken.on("btn-bind-server-secret", async (payload) => {
         }
       });
       newSecretVal = "";
+      state.bindForm.new_secret_value = "";
       if (self.kraken.formData) {
         delete self.kraken.formData.bind_new_secret_value;
       }
@@ -2551,10 +2646,19 @@ self.kraken.on("btn-bind-server-secret", async (payload) => {
     if (srv && srv.hostname) {
       state.config.server_bindings[srv.hostname] = secretName;
     }
+    if (srv && srv.name) {
+      state.config.server_bindings[srv.name] = secretName;
+    }
     state.bindForm.selected_server_id = srvId;
     state.bindForm.secret_name = secretName;
+    state.bindForm.new_secret_value = "";
 
     await persistConfig();
+
+    try {
+      await callBackendAction("bind_host_secret", { server_id: srvId, secret_name: secretName });
+    } catch (_) {}
+
     state.message = {
       type: "success",
       text: `Servidor '${srv ? srv.name : srvId}' vinculado ao secret '${secretName}' no Azure Key Vault (resolução Just-in-Time ativa, zero armazenamento local)!`
@@ -3000,19 +3104,22 @@ self.kraken.on("btn-refresh-tab-secrets", async () => {
 
 // Startup initialization
 (async () => {
+  const user = self.kraken.user || self.kraken.params?.user || self.kraken.context?.user || self.kraken.session?.user || null;
+  state.krakenUser = user;
+
   await loadConfig();
   detectKrakenUser();
   await loadMonitoredServers();
   renderUI();
 
   // Run initial discoveries sequentially with settling delays to avoid Wazero instantiation races
-  if (state.config.accounts && state.config.accounts.length > 0) {
+  if (state.config.accounts && state.config.accounts.length > 0 && !state.config.user_disconnected) {
     try {
       await discoverUserVaults(true);
     } catch (_) {}
   }
 
-  if (isKeyVaultOperable()) {
+  if (isKeyVaultOperable() && !state.config.user_disconnected) {
     try {
       await new Promise(r => setTimeout(r, 150));
       await performTestConnection(true);
