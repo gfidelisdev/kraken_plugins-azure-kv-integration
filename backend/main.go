@@ -314,7 +314,7 @@ func getActiveAccount(cfg *Config) *MicrosoftAccount {
 }
 
 func findExplicitStandaloneAccount(cfg *Config) *MicrosoftAccount {
-	if cfg == nil || len(cfg.Accounts) == 0 || cfg.ActiveAccountID == "" || cfg.ActiveAccountID == "kraken-ms-session" {
+	if cfg == nil || len(cfg.Accounts) == 0 || cfg.ActiveAccountID == "" || cfg.ActiveAccountID == "kraken-ms-session" || strings.HasPrefix(cfg.ActiveAccountID, "kraken-ms-") {
 		return nil
 	}
 	for i := range cfg.Accounts {
