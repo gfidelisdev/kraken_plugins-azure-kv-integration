@@ -1371,11 +1371,13 @@ function renderFullPage() {
                     <div style="font-size: 14px; margin-bottom: 16px; color: #eee;">
                       Passo 2: Clique no botão abaixo para abrir a janela da Microsoft (o código já é copiado automaticamente):
                     </div>
-                    <a href="https://microsoft.com/devicelogin" 
+                    <a href="${state.deviceLogin.verification_uri || 'https://microsoft.com/devicelogin'}" 
                        target="_blank" 
                        rel="noopener noreferrer"
+                       data-copy-text="${state.deviceLogin.user_code}"
+                       data-copy="${state.deviceLogin.user_code}"
                        onclick="try { navigator.clipboard.writeText('${state.deviceLogin.user_code}'); } catch(e) {}"
-                       style="display: inline-flex; align-items: center; gap: 10px; background: #0078D4; color: #ffffff; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 700; font-size: 15px; box-shadow: 0 4px 12px rgba(0,120,212,0.4);">
+                       style="display: inline-flex; align-items: center; gap: 10px; background: #0078D4; color: #ffffff; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 700; font-size: 15px; box-shadow: 0 4px 12px rgba(0,120,212,0.4); cursor: pointer;">
                       <svg width="20" height="20" viewBox="0 0 21 21" fill="none" xmlns="http://www.w3.org/2000/svg">
                         <rect x="1" y="1" width="9" height="9" fill="#F25022"/>
                         <rect x="11" y="1" width="9" height="9" fill="#7FBA00"/>
@@ -2095,7 +2097,7 @@ self.kraken.on("btn-connect-microsoft-account", async () => {
         active: true,
         user_code: res.data.user_code,
         device_code: res.data.device_code,
-        verification_uri: "https://microsoft.com/devicelogin",
+        verification_uri: res.data.verification_uri || "https://microsoft.com/devicelogin",
         message: res.data.message || "",
         polling: false,
         pollTimer: null,
